@@ -1,5 +1,9 @@
 # erlang_ws
 
+[![CI](https://github.com/benoitc/erlang_ws/actions/workflows/ci.yml/badge.svg)](https://github.com/benoitc/erlang_ws/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/erlang_ws.svg)](https://hex.pm/packages/erlang_ws)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 WebSocket protocol library for Erlang. Pure-Erlang, no runtime
 dependencies.
 
