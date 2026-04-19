@@ -72,7 +72,7 @@ roundtrip_test_() ->
           D = ws_deflate:init_deflate(N, server),
           I = ws_deflate:init_inflate(N, client),
           Wire = ws_deflate:deflate(D, takeover, Data),
-          Back = ws_deflate:inflate(I, takeover, Wire),
+          {ok, Back} = ws_deflate:inflate(I, takeover, Wire),
           ?assertEqual(Data, Back),
           zlib:close(D), zlib:close(I)
       end}

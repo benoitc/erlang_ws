@@ -1,3 +1,17 @@
+%% Copyright 2026 Benoit Chesneau
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+
 %% @doc Reference HTTP/1.1 WebSocket server over `gen_tcp'.
 %%
 %% A minimal acceptor-loop + upgrade driver built on top of the
@@ -32,15 +46,19 @@
 -export([start_link/1, stop/1, port/1]).
 
 -type opts() :: #{
-    port         => inet:port_number(),
-    ip           => inet:ip_address() | any,
-    handler      := module(),
-    handler_opts => term(),
-    subprotocols => [binary()],
-    tls          => [term()],
-    parser_opts  => map(),
-    timeout      => timeout()
+    port               => inet:port_number(),
+    ip                 => inet:ip_address() | any,
+    handler            := module(),
+    handler_opts       => term(),
+    subprotocols       => [binary()],
+    tls                => [term()],
+    parser_opts        => map(),
+    timeout            => timeout(),
+    max_handshake_size => pos_integer()
 }.
+
+%% Default guard against unbounded pre-upgrade read.
+-define(DEFAULT_MAX_HANDSHAKE, 64 * 1024).
 
 -export_type([opts/0]).
 
@@ -134,7 +152,8 @@ spawn_upgrade(Sock, Opts, Timeout) ->
 
 serve(Sock, Opts, Timeout) ->
     {Transport, Handle, Rest0} = maybe_tls(Sock, Opts, Timeout),
-    case read_request(Transport, Handle, Rest0, Timeout) of
+    MaxHs = maps:get(max_handshake_size, Opts, ?DEFAULT_MAX_HANDSHAKE),
+    case read_request(Transport, Handle, Rest0, Timeout, MaxHs) of
         {ok, Method, Path, Hdrs, Rest} ->
             handshake(Transport, Handle, Method, Path, Hdrs, Rest, Opts);
         {error, _} ->
@@ -205,37 +224,36 @@ start_session(Transport, Handle, Method, Path, Hdrs, Info, Rest, Opts) ->
 %% ---------------------------------------------------------------------
 %% HTTP parsing / encoding — enough for the handshake line + headers.
 
-read_request(Transport, Handle, Seed, Timeout) ->
-    read_request(Transport, Handle, Seed, Timeout, erlang:monotonic_time(millisecond)).
+read_request(Transport, Handle, Seed, Timeout, MaxHs) ->
+    read_request(Transport, Handle, Seed, Timeout,
+                 erlang:monotonic_time(millisecond), MaxHs).
 
-read_request(Transport, Handle, Acc, Timeout, Start) ->
+read_request(Transport, Handle, Acc, Timeout, Start, MaxHs) ->
     case erlang:decode_packet(http_bin, Acc, []) of
         {more, _} ->
-            case Transport:recv(Handle, remaining(Timeout, Start)) of
-                {ok, Bin} ->
-                    read_request(Transport, Handle,
-                                 <<Acc/binary, Bin/binary>>, Timeout, Start);
+            case grow(Transport, Handle, Acc, Timeout, Start, MaxHs) of
+                {ok, Acc2} ->
+                    read_request(Transport, Handle, Acc2, Timeout, Start, MaxHs);
                 Err -> Err
             end;
         {ok, {http_request, M, P, _V}, Rest} ->
             Path = http_path(P),
             Method = http_method(M),
             read_headers(Transport, Handle, Rest, Method, Path, [],
-                         Timeout, Start);
+                         Timeout, Start, MaxHs);
         {ok, {http_error, _}, _} ->
             {error, bad_request};
         {error, R} ->
             {error, R}
     end.
 
-read_headers(Transport, Handle, Buf, M, P, Acc, Timeout, Start) ->
+read_headers(Transport, Handle, Buf, M, P, Acc, Timeout, Start, MaxHs) ->
     case erlang:decode_packet(httph_bin, Buf, []) of
         {more, _} ->
-            case Transport:recv(Handle, remaining(Timeout, Start)) of
-                {ok, Bin} ->
-                    read_headers(Transport, Handle,
-                                 <<Buf/binary, Bin/binary>>,
-                                 M, P, Acc, Timeout, Start);
+            case grow(Transport, Handle, Buf, Timeout, Start, MaxHs) of
+                {ok, Buf2} ->
+                    read_headers(Transport, Handle, Buf2,
+                                 M, P, Acc, Timeout, Start, MaxHs);
                 Err -> Err
             end;
         {ok, http_eoh, Rest} ->
@@ -243,9 +261,20 @@ read_headers(Transport, Handle, Buf, M, P, Acc, Timeout, Start) ->
         {ok, {http_header, _, Name, _, Value}, Rest} ->
             N = header_name(Name),
             read_headers(Transport, Handle, Rest, M, P,
-                         [{N, Value} | Acc], Timeout, Start);
+                         [{N, Value} | Acc], Timeout, Start, MaxHs);
         {error, R} ->
             {error, R}
+    end.
+
+grow(Transport, Handle, Acc, Timeout, Start, MaxHs) ->
+    case Transport:recv(Handle, remaining(Timeout, Start)) of
+        {ok, Bin} ->
+            Acc2 = <<Acc/binary, Bin/binary>>,
+            case byte_size(Acc2) > MaxHs of
+                true  -> {error, handshake_too_big};
+                false -> {ok, Acc2}
+            end;
+        Err -> Err
     end.
 
 http_path({abs_path, P})    -> P;

@@ -4,6 +4,43 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-04-19
+
+### Security
+
+- `ws_h1_upgrade:validate_request/1,2` no longer crashes on a
+  malformed `Sec-WebSocket-Key` header; invalid base64 now surfaces
+  as `{error, bad_sec_websocket_key}`.
+- `ws_deflate:inflate/3,4` caps inflated output (default 64 MiB,
+  configurable) and returns `{error, {inflate_too_big, _}}` past
+  the bound — defuses the classic permessage-deflate bomb.
+- `ws_client:connect/2` caps pre-upgrade byte accumulation via a new
+  `max_handshake_size` option (default 64 KiB). Exceeding it
+  returns `{error, handshake_response_too_big}`.
+- `ws_h1_tcp_server:start_link/1` gains the same
+  `max_handshake_size` option (default 64 KiB). Over-limit returns
+  `{error, handshake_too_big}` and the socket is closed.
+
+### Tests
+
+- New `ws_security_SUITE` with 11 targeted cases covering each of
+  the above plus state-machine invariants (send during closing,
+  handler init stop, ordered multi-frame send).
+
+### Documentation
+
+- `docs/embedding.md` — new "Hardening" section summarising the
+  embedder-side defences: handshake caps, timeouts, concurrent
+  connections, origin enforcement, deflate bombs, TLS defaults,
+  close-code handling.
+- `docs/errors.md` — new "Size-limit errors" table.
+
+### Housekeeping
+
+- Apache-2.0 copyright header added to every `.erl` file.
+
+[0.1.1]: https://github.com/benoitc/erlang_ws/releases/tag/0.1.1
+
 ## [0.1.0] — 2026-04-19
 
 Initial release.

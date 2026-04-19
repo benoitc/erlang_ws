@@ -1,3 +1,17 @@
+%% Copyright 2026 Benoit Chesneau
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+
 %% @doc RFC 7692 — permessage-deflate extension helpers.
 %%
 %% Provides negotiation (parse client offer / build server response),
@@ -16,7 +30,12 @@
 -export([client_offer/1]).
 -export([parse_server_response/1]).
 -export([init_inflate/2, init_deflate/2]).
--export([inflate/3, deflate/3]).
+-export([inflate/3, inflate/4, deflate/3]).
+
+%% Default guard against deflate bombs: 64 MiB of inflated output
+%% per call. Callers handling untrusted compressed input SHOULD pass
+%% a tighter bound via `inflate/4'.
+-define(DEFAULT_MAX_INFLATE, 64 * 1024 * 1024).
 
 -type opts() :: #{
     server_context_takeover => takeover | no_takeover,
@@ -198,15 +217,52 @@ init_deflate(#{client_max_window_bits := CBits, server_max_window_bits := SBits}
 %% ---------------------------------------------------------------------
 %% Codec.
 
--spec inflate(zlib:zstream(), takeover | no_takeover, iodata()) -> binary().
+-spec inflate(zlib:zstream(), takeover | no_takeover, iodata()) ->
+    {ok, binary()} | {error, {inflate_too_big, pos_integer()}}.
 inflate(Z, Takeover, Data) ->
-    %% Re-append the trailing empty block stripped on the wire.
-    Out = iolist_to_binary(zlib:inflate(Z, [Data, <<0, 0, 255, 255>>])),
-    case Takeover of
-        no_takeover -> ok = zlib:inflateReset(Z);
-        takeover -> ok
-    end,
-    Out.
+    inflate(Z, Takeover, Data, ?DEFAULT_MAX_INFLATE).
+
+-spec inflate(zlib:zstream(), takeover | no_takeover, iodata(),
+              pos_integer() | infinity) ->
+    {ok, binary()} | {error, {inflate_too_big, pos_integer() | infinity}}.
+inflate(Z, Takeover, Data, MaxSize) ->
+    %% Re-append the trailing empty block stripped on the wire, then
+    %% feed the whole thing through `safeInflate' chunk-by-chunk so
+    %% we can abort as soon as we cross `MaxSize' — a zlib bomb stops
+    %% at the bound rather than allocating unbounded memory first.
+    Input = iolist_to_binary([Data, <<0, 0, 255, 255>>]),
+    case feed(Z, Input, MaxSize, 0, []) of
+        {ok, Out} ->
+            case Takeover of
+                no_takeover -> ok = zlib:inflateReset(Z);
+                takeover -> ok
+            end,
+            {ok, Out};
+        {error, _} = E ->
+            E
+    end.
+
+feed(Z, Input, MaxSize, Size, Acc) ->
+    case zlib:safeInflate(Z, Input) of
+        {finished, Chunk} ->
+            NewSize = Size + iolist_size(Chunk),
+            check_size(MaxSize, NewSize,
+                       fun() -> {ok, iolist_to_binary(lists:reverse([Chunk | Acc]))} end);
+        {continue, Chunk} ->
+            NewSize = Size + iolist_size(Chunk),
+            check_size(MaxSize, NewSize,
+                       %% After the first call, `safeInflate' pulls
+                       %% more output by being fed `[]' — the input
+                       %% is already in the stream's buffer.
+                       fun() -> feed(Z, [], MaxSize, NewSize, [Chunk | Acc]) end);
+        {need_dictionary, _, _} ->
+            {error, need_dictionary}
+    end.
+
+check_size(infinity, _, Cont) -> Cont();
+check_size(Max, Size, _) when Size > Max ->
+    {error, {inflate_too_big, Max}};
+check_size(_, _, Cont) -> Cont().
 
 -spec deflate(zlib:zstream(), takeover | no_takeover, iodata()) -> binary().
 deflate(Z, Takeover, Data) ->

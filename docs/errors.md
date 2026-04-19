@@ -115,3 +115,11 @@ fails.
 If a custom transport does not implement `recv/2` and the client
 needs it, `ws_client:connect/2` returns
 `{error, {transport_does_not_support_recv, Mod}}`.
+
+## Size-limit errors
+
+| `Reason`                         | Source                                   |
+|----------------------------------|------------------------------------------|
+| `handshake_too_big`              | Server pre-upgrade read over `max_handshake_size` (default 64 KiB). |
+| `handshake_response_too_big`     | Client 101 response read over `max_handshake_size`. |
+| `{inflate_too_big, MaxSize}`     | `ws_deflate:inflate/3,4` output exceeded the cap. |

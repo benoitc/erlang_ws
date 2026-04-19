@@ -1,3 +1,17 @@
+%% Copyright 2026 Benoit Chesneau
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+
 %% @doc RFC 6455 handshake helpers for WebSocket over HTTP/1.1.
 %%
 %% Embedders provide a parsed HTTP request or response (method, target,
@@ -122,9 +136,15 @@ check_key(H) ->
     case header_value(<<"sec-websocket-key">>, H) of
         undefined -> {error, missing_sec_websocket_key};
         Key when is_binary(Key) ->
-            case byte_size(base64:decode(Key)) of
-                16 -> ok;
+            %% base64:decode/1 crashes on invalid input (byte length
+            %% not multiple of 4, non-base64 chars, ...). Guard so a
+            %% malformed header becomes a typed error rather than a
+            %% crash the caller has to reason about.
+            try base64:decode(Key) of
+                Decoded when byte_size(Decoded) =:= 16 -> ok;
                 _ -> {error, bad_sec_websocket_key}
+            catch
+                _:_ -> {error, bad_sec_websocket_key}
             end
     end.
 

@@ -1,3 +1,17 @@
+%% Copyright 2026 Benoit Chesneau
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+
 %% @doc WebSocket client connect for `ws://' / `wss://' URLs.
 %%
 %% The client connects over plain TCP (`ws') or TLS (`wss'), sends the
@@ -14,16 +28,21 @@
 
 -type url() :: binary() | string().
 -type opts() :: #{
-    handler          := module(),
-    handler_opts     => term(),
-    subprotocols     => [binary()],
-    extensions       => [binary()],
-    origin           => binary(),
-    extra_headers    => [{binary(), binary()}],
-    timeout          => timeout(),
-    ssl_opts         => list(),
-    parser_opts      => map()
+    handler            := module(),
+    handler_opts       => term(),
+    subprotocols       => [binary()],
+    extensions         => [binary()],
+    origin             => binary(),
+    extra_headers      => [{binary(), binary()}],
+    timeout            => timeout(),
+    max_handshake_size => pos_integer(),
+    ssl_opts           => list(),
+    parser_opts        => map()
 }.
+
+%% Default guard against a peer that feeds us bytes but never
+%% completes the 101 response — stop accumulating at 64 KiB.
+-define(DEFAULT_MAX_HANDSHAKE, 64 * 1024).
 
 -export_type([url/0, opts/0]).
 
@@ -32,9 +51,11 @@ connect(Url, Opts) ->
     case parse_url(Url) of
         {ok, Scheme, Host, Port, Path} ->
             Timeout = maps:get(timeout, Opts, 15000),
+            MaxHs = maps:get(max_handshake_size, Opts, ?DEFAULT_MAX_HANDSHAKE),
             case dial(Scheme, Host, Port, Opts, Timeout) of
                 {ok, Transport, Handle} ->
-                    upgrade(Transport, Handle, Host, Port, Path, Opts, Timeout);
+                    upgrade(Transport, Handle, Host, Port, Path, Opts,
+                            Timeout, MaxHs);
                 {error, _} = E ->
                     E
             end;
@@ -93,13 +114,13 @@ merge_ssl_opts(Base, User) ->
                      not lists:member(element(1, B), UserKeys)],
     Filtered ++ User.
 
-upgrade(Transport, Handle, Host, Port, Path, Opts, Timeout) ->
+upgrade(Transport, Handle, Host, Port, Path, Opts, Timeout, MaxHs) ->
     ClientOpts = maps:with([subprotocols, extensions, origin, extra_headers], Opts),
     {Key, Hdrs} = ws_h1_upgrade:build_request(Host, Port, Path, ClientOpts),
     Request = format_request(Path, Hdrs),
     case Transport:send(Handle, Request) of
         ok ->
-            case read_response(Transport, Handle, Timeout) of
+            case read_response(Transport, Handle, Timeout, MaxHs) of
                 {ok, Status, RespHdrs, _Rest} ->
                     case ws_h1_upgrade:validate_response(Status, RespHdrs) of
                         {ok, Info} ->
@@ -164,36 +185,35 @@ format_request(Path, Hdrs) ->
      [[N, <<": ">>, V, <<"\r\n">>] || {N, V} <- Hdrs],
      <<"\r\n">>].
 
-read_response(Transport, Handle, Timeout) ->
+read_response(Transport, Handle, Timeout, MaxHs) ->
     Start = erlang:monotonic_time(millisecond),
-    read_response_loop(Transport, Handle, <<>>, Timeout, Start).
+    read_response_loop(Transport, Handle, <<>>, Timeout, Start, MaxHs).
 
-read_response_loop(Transport, Handle, Acc, Timeout, Start) ->
+read_response_loop(Transport, Handle, Acc, Timeout, Start, MaxHs) ->
     case erlang:decode_packet(http_bin, Acc, []) of
         {more, _} ->
-            case do_recv(Transport, Handle, remaining(Timeout, Start)) of
-                {ok, Bin} ->
-                    read_response_loop(Transport, Handle,
-                                       <<Acc/binary, Bin/binary>>,
-                                       Timeout, Start);
+            case grow(Transport, Handle, Acc, Timeout, Start, MaxHs) of
+                {ok, Acc2} ->
+                    read_response_loop(Transport, Handle, Acc2,
+                                       Timeout, Start, MaxHs);
                 Err -> Err
             end;
         {ok, {http_response, _Ver, Status, _Reason}, Rest} ->
             read_headers(Transport, Handle, Rest, Status, [],
-                         Timeout, Start);
+                         Timeout, Start, MaxHs);
         {ok, {http_error, _}, _} ->
             {error, bad_http_response};
         {error, R} ->
             {error, R}
     end.
 
-read_headers(Transport, Handle, Buf, Status, Acc, Timeout, Start) ->
+read_headers(Transport, Handle, Buf, Status, Acc, Timeout, Start, MaxHs) ->
     case erlang:decode_packet(httph_bin, Buf, []) of
         {more, _} ->
-            case do_recv(Transport, Handle, remaining(Timeout, Start)) of
-                {ok, Bin} ->
-                    read_headers(Transport, Handle, <<Buf/binary, Bin/binary>>,
-                                 Status, Acc, Timeout, Start);
+            case grow(Transport, Handle, Buf, Timeout, Start, MaxHs) of
+                {ok, Buf2} ->
+                    read_headers(Transport, Handle, Buf2,
+                                 Status, Acc, Timeout, Start, MaxHs);
                 Err -> Err
             end;
         {ok, http_eoh, Rest} ->
@@ -201,9 +221,20 @@ read_headers(Transport, Handle, Buf, Status, Acc, Timeout, Start) ->
         {ok, {http_header, _, Name, _, Value}, Rest} ->
             Name2 = normalize_header_name(Name),
             read_headers(Transport, Handle, Rest, Status,
-                         [{Name2, Value} | Acc], Timeout, Start);
+                         [{Name2, Value} | Acc], Timeout, Start, MaxHs);
         {error, R} ->
             {error, R}
+    end.
+
+grow(Transport, Handle, Acc, Timeout, Start, MaxHs) ->
+    case do_recv(Transport, Handle, remaining(Timeout, Start)) of
+        {ok, Bin} ->
+            Acc2 = <<Acc/binary, Bin/binary>>,
+            case byte_size(Acc2) > MaxHs of
+                true  -> {error, handshake_response_too_big};
+                false -> {ok, Acc2}
+            end;
+        Err -> Err
     end.
 
 normalize_header_name(Name) when is_atom(Name) ->

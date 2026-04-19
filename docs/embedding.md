@@ -132,6 +132,40 @@ pseudo-header shape is identical; the difference is the transport
 (QUIC streams instead of H2 streams). Wire it up the same way as H2
 above, substituting your H3 stream helpers.
 
+## Hardening
+
+`erlang_ws` defends the parts of the protocol it owns. A handful of
+decisions remain with the embedder — they depend on the rest of your
+HTTP stack and your deployment environment.
+
+- **Handshake size.** `ws_h1_tcp_server` and `ws_client` each cap
+  pre-upgrade byte accumulation at 64 KiB (`max_handshake_size`
+  option). Full HTTP stacks usually have their own limit (for example
+  `h1_max_header_list_size`); apply whichever is tighter.
+- **Handshake timeout.** Default 15 000 ms on both sides. A slow
+  client is a cheap DoS; tune `timeout` if you terminate WebSockets
+  in front of a large connection pool.
+- **Per-frame / per-message size.** Tune `parser_opts => #{max_frame
+  => _, max_message => _}` on `ws:accept/6` / `ws:connect/2`.
+  Defaults: 16 MiB frame, 64 MiB message. Exceeding either aborts
+  with close code 1009.
+- **Concurrent connections.** Neither `ws_h1_tcp_server` nor
+  `ws:accept/5` caps the number of live sessions. Gate the accept
+  loop (for instance with a semaphore or a Ranch-style conns_sup) in
+  front of the library.
+- **Origin enforcement.** The library surfaces the `Origin:` header
+  in `request_info` but does not check it — embedder concern.
+- **permessage-deflate bombs.** `ws_deflate:inflate/4` takes a
+  `MaxSize` bound and returns `{error, {inflate_too_big, _}}` past
+  it. `inflate/3` uses a 64 MiB default; pass `infinity` only for
+  trusted input.
+- **TLS.** The client connects with `verify_peer`, OS CA trust, and
+  SNI by default; on the server side pass strong cipher / version
+  constraints through the `tls` option.
+- **Close codes.** Only codes that `ws_close:valid_on_wire/1`
+  accepts may traverse the wire; invalid codes from your handler
+  are downgraded to 1002 (protocol error).
+
 ## Writing your own transport
 
 Implement the `ws_transport` behaviour:
