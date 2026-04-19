@@ -1,0 +1,330 @@
+%% @doc WebSocket session state machine.
+%%
+%% Owns a single stream handle (supplied by the embedder through a
+%% `ws_transport' callback), drives the frame codec, auto-responds to
+%% control frames, and dispatches inbound messages to the user handler
+%% module.
+%%
+%% States:
+%%   open    — handshake complete, frames flowing in both directions.
+%%   closing — a close frame was sent or received; the other direction
+%%             may still finish.
+%%   closed  — both directions closed; the process is about to exit.
+%%
+%% Inbound-byte delivery is pull-based: after consuming a chunk the
+%% session calls `TransportMod:activate/1' to request the next one. The
+%% transport signals fresh bytes with `{ws_data, Handle, Bin}', peer
+%% close with `{ws_closed, Handle}', and socket-level errors with
+%% `{ws_error, Handle, Reason}'.
+-module(ws_session).
+-behaviour(gen_statem).
+
+-export([start_link/1, start/1]).
+-export([activate/1]).
+-export([send/2, close/2, close/3, stop/1]).
+
+-export([init/1, callback_mode/0, terminate/3, code_change/4]).
+-export([ready_wait/3, open/3, closing/3]).
+
+-include("../include/ws.hrl").
+
+-record(st, {
+    transport_mod :: module(),
+    handle :: term(),
+    role :: client | server,
+    parser :: ws_frame:parser(),
+    handler_mod :: module(),
+    handler_state :: term(),
+    close_sent = false :: boolean(),
+    close_received = false :: boolean()
+}).
+
+-type start_opts() :: #{
+    transport := module(),
+    handle    := term(),
+    role      := client | server,
+    handler   := module(),
+    handler_opts => term(),
+    req       => map(),
+    parser_opts => map()
+}.
+
+-export_type([start_opts/0]).
+
+%% ---------------------------------------------------------------------
+%% API
+
+-spec start_link(start_opts()) -> {ok, pid()} | {error, term()}.
+start_link(Opts) ->
+    gen_statem:start_link(?MODULE, Opts, []).
+
+-spec start(start_opts()) -> {ok, pid()} | {error, term()}.
+start(Opts) ->
+    gen_statem:start(?MODULE, Opts, []).
+
+%% @doc Tell the session the embedder has finished transport setup
+%% (ownership transfer and friends) — the session may now read bytes.
+-spec activate(pid()) -> ok.
+activate(Pid) ->
+    gen_statem:cast(Pid, activate).
+
+-spec send(pid(), ws_frame:frame() | [ws_frame:frame()]) -> ok.
+send(Pid, FrameOrFrames) ->
+    gen_statem:cast(Pid, {send, frames(FrameOrFrames)}).
+
+-spec close(pid(), ws_close:code()) -> ok.
+close(Pid, Code) -> close(Pid, Code, <<>>).
+
+-spec close(pid(), ws_close:code(), iodata()) -> ok.
+close(Pid, Code, Reason) ->
+    gen_statem:cast(Pid, {close, Code, iolist_to_binary(Reason)}).
+
+-spec stop(pid()) -> ok.
+stop(Pid) -> gen_statem:stop(Pid).
+
+%% ---------------------------------------------------------------------
+%% gen_statem callbacks
+
+callback_mode() -> state_functions.
+
+init(#{transport := TM, handle := H, role := Role,
+       handler := HMod} = Opts) ->
+    ParserOpts = maps:get(parser_opts, Opts, #{}),
+    Parser = ws_frame:init_parser(ParserOpts#{role => Role}),
+    HOpts = maps:get(handler_opts, Opts, #{}),
+    Req = maps:get(req, Opts, #{}),
+    case HMod:init(Req, HOpts) of
+        {ok, HState} ->
+            post_init(TM, H, Role, Parser, HMod, HState, []);
+        {reply, Frames, HState} ->
+            post_init(TM, H, Role, Parser, HMod, HState, frames(Frames));
+        {stop, Reason} ->
+            _ = TM:close(H),
+            {stop, Reason}
+    end.
+
+post_init(TM, H, Role, Parser, HMod, HState, Frames) ->
+    St = #st{transport_mod = TM, handle = H, role = Role,
+             parser = Parser, handler_mod = HMod,
+             handler_state = HState},
+    case send_frames(Frames, St) of
+        {ok, St2} ->
+            %% Defer activation until the embedder calls
+            %% `ws_session:activate/1' — otherwise an earlier
+            %% `inet:setopts' can deliver bytes to the original socket
+            %% owner before `controlling_process/2' has run.
+            {ok, ready_wait, St2};
+        {error, Reason} ->
+            {stop, Reason}
+    end.
+
+%% --- ready_wait state -------------------------------------------------
+%%
+%% Frames can be queued via `send' while we wait; inbound bytes cannot
+%% arrive yet because the transport has not been activated.
+
+ready_wait(cast, activate, St = #st{transport_mod = TM, handle = H}) ->
+    ok = TM:activate(H),
+    {next_state, open, St};
+ready_wait(cast, {send, Frames}, St) ->
+    case send_frames(Frames, St) of
+        {ok, St2} -> {keep_state, St2};
+        {error, Reason} -> {stop, Reason, St}
+    end;
+ready_wait(cast, {close, Code, Reason}, St) ->
+    initiate_close(Code, Reason, St);
+ready_wait(_EventType, _Msg, _St) ->
+    keep_state_and_data.
+
+%% --- open state -------------------------------------------------------
+
+open(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P,
+                         handler_mod = HMod, handler_state = HState}) ->
+    case TM:classify(Msg, H) of
+        {ws_data, H, Bin} ->
+            case ws_frame:parse(P, Bin) of
+                {ok, Messages, P2} ->
+                    dispatch_messages(Messages, St#st{parser = P2}, open);
+                {error, Reason, P2} ->
+                    abort_with_close(close_code_for(Reason), Reason,
+                                     St#st{parser = P2})
+            end;
+        {ws_closed, H} ->
+            {stop, normal, St};
+        {ws_error, H, Reason} ->
+            {stop, {transport_error, Reason}, St};
+        ignore ->
+            case maybe_handler_info(HMod, Msg, HState) of
+                passthrough ->
+                    keep_state_and_data;
+                {ok, HState2} ->
+                    {keep_state, St#st{handler_state = HState2}};
+                {reply, Frames, HState2} ->
+                    case send_frames(frames(Frames),
+                                     St#st{handler_state = HState2}) of
+                        {ok, St2} -> {keep_state, St2};
+                        {error, Reason} -> {stop, Reason, St}
+                    end;
+                {stop, Reason, HState2} ->
+                    {stop, Reason, St#st{handler_state = HState2}}
+            end
+    end;
+open(cast, {send, Frames}, St) ->
+    case send_frames(Frames, St) of
+        {ok, St2} -> {keep_state, St2};
+        {error, Reason} -> {stop, Reason, St}
+    end;
+open(cast, {close, Code, Reason}, St) ->
+    initiate_close(Code, Reason, St).
+
+%% --- closing state ----------------------------------------------------
+%%
+%% We have either sent or received a close frame. Keep draining until
+%% the other direction completes, then exit.
+
+closing(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P}) ->
+    case TM:classify(Msg, H) of
+        {ws_data, H, Bin} ->
+            case ws_frame:parse(P, Bin) of
+                {ok, Messages, P2} ->
+                    dispatch_messages(Messages, St#st{parser = P2}, closing);
+                {error, _Reason, P2} ->
+                    finish_close(St#st{parser = P2})
+            end;
+        {ws_closed, H} ->
+            finish_close(St);
+        {ws_error, H, _R} ->
+            finish_close(St);
+        ignore ->
+            keep_state_and_data
+    end;
+closing(cast, {send, _}, _St) ->
+    keep_state_and_data;
+closing(cast, {close, _C, _R}, _St) ->
+    keep_state_and_data;
+closing(_Et, _Msg, _St) ->
+    keep_state_and_data.
+
+%% --- shared dispatching ----------------------------------------------
+
+dispatch_messages([], St, State) ->
+    reactivate(St, State);
+dispatch_messages([Msg | Rest], St, State) ->
+    case handle_message(Msg, St, State) of
+        {continue, St2, State2} ->
+            dispatch_messages(Rest, St2, State2);
+        {stop, Reason, St2} ->
+            {stop, Reason, St2}
+    end.
+
+handle_message(close, St, _State) ->
+    handle_close_received(?WS_CLOSE_NORMAL, <<>>, St);
+handle_message({close, Code, Reason}, St, _State) ->
+    handle_close_received(Code, Reason, St);
+handle_message({ping, Payload}, St = #st{}, State) ->
+    case send_frames([{pong, Payload}], St) of
+        {ok, St2} ->
+            %% also notify the handler (optional — keeps parity with cowboy)
+            invoke_handler({ping, Payload}, St2, State);
+        {error, Reason} ->
+            {stop, Reason, St}
+    end;
+handle_message({pong, _} = M, St, State) ->
+    invoke_handler(M, St, State);
+handle_message({text, _} = M, St, State) ->
+    invoke_handler(M, St, State);
+handle_message({binary, _} = M, St, State) ->
+    invoke_handler(M, St, State).
+
+invoke_handler(Msg, St = #st{handler_mod = HMod, handler_state = HState}, _State) ->
+    case HMod:handle_in(Msg, HState) of
+        {ok, HState2} ->
+            {continue, St#st{handler_state = HState2}, _State};
+        {reply, Frames, HState2} ->
+            case send_frames(frames(Frames), St#st{handler_state = HState2}) of
+                {ok, St2} -> {continue, St2, _State};
+                {error, Reason} -> {stop, Reason, St}
+            end;
+        {stop, Reason, HState2} ->
+            {stop, Reason, St#st{handler_state = HState2}}
+    end.
+
+%% Peer sent us a close frame. Echo one back (once) and switch to
+%% closing; let the peer close the TCP side.
+handle_close_received(_Code, _Reason, St = #st{close_sent = true}) ->
+    St2 = St#st{close_received = true},
+    finish_close(St2);
+handle_close_received(Code, _Reason, St) ->
+    Echo = close_echo(Code),
+    case send_frames([Echo], St) of
+        {ok, St2} ->
+            {stop, normal, St2#st{close_sent = true, close_received = true}};
+        {error, Reason} ->
+            {stop, Reason, St}
+    end.
+
+close_echo(Code) ->
+    case ws_close:valid_on_wire(Code) of
+        true -> {close, Code, <<>>};
+        false -> {close, ?WS_CLOSE_PROTOCOL_ERROR, <<>>}
+    end.
+
+initiate_close(Code, Reason, St = #st{close_sent = false}) ->
+    case send_frames([{close, Code, Reason}], St#st{close_sent = true}) of
+        {ok, St2} -> {next_state, closing, St2};
+        {error, R} -> {stop, R, St}
+    end;
+initiate_close(_C, _R, St) ->
+    {keep_state, St}.
+
+abort_with_close(Code, Reason, St) ->
+    _ = send_frames([{close, Code, io_code_reason(Reason)}], St),
+    _ = (St#st.transport_mod):close(St#st.handle),
+    {stop, normal, St#st{close_sent = true}}.
+
+io_code_reason(invalid_utf8)   -> <<"invalid utf-8">>;
+io_code_reason(message_too_big) -> <<"message too big">>;
+io_code_reason(bad_close_code) -> <<"bad close code">>;
+io_code_reason(_)               -> <<"protocol error">>.
+
+close_code_for(invalid_utf8)    -> ?WS_CLOSE_INVALID_UTF8;
+close_code_for(message_too_big) -> ?WS_CLOSE_TOO_BIG;
+close_code_for(_)               -> ?WS_CLOSE_PROTOCOL_ERROR.
+
+reactivate(St = #st{transport_mod = TM, handle = H}, StateName) ->
+    _ = TM:activate(H),
+    case StateName of
+        open    -> {keep_state, St};
+        closing -> {keep_state, St}
+    end.
+
+finish_close(St) ->
+    _ = (St#st.transport_mod):close(St#st.handle),
+    {stop, normal, St}.
+
+maybe_handler_info(HMod, Msg, HState) ->
+    case erlang:function_exported(HMod, handle_info, 2) of
+        true -> HMod:handle_info(Msg, HState);
+        false -> passthrough
+    end.
+
+frames(L) when is_list(L) -> L;
+frames(F) -> [F].
+
+send_frames([], St) -> {ok, St};
+send_frames([F | Rest], St = #st{transport_mod = TM, handle = H, role = Role}) ->
+    Iolist = ws_frame:encode(F, Role),
+    case TM:send(H, Iolist) of
+        ok -> send_frames(Rest, St);
+        {error, _} = E -> E
+    end.
+
+terminate(_Reason, _StateName, #st{handler_mod = HMod, handler_state = HS}) ->
+    _ = case erlang:function_exported(HMod, terminate, 2) of
+        true -> HMod:terminate(_Reason, HS);
+        false -> ok
+    end,
+    ok.
+
+code_change(_OldVsn, State, Data, _Extra) ->
+    {ok, State, Data}.

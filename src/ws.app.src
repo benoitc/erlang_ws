@@ -1,0 +1,25 @@
+{application, ws,
+ [{description, "WebSocket protocol library for Erlang (RFC 6455 / RFC 8441 / RFC 9220)"},
+  {vsn, "0.1.0"},
+  {registered, [ws_sup]},
+  {mod, {ws_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    ssl,
+    crypto,
+    public_key
+   ]},
+  {env, []},
+  {modules, []},
+  %% The short `ws' name is taken on hex.pm, so the package is
+  %% published as `erlang_ws'. The OTP application and module atom
+  %% stay `ws' — call sites keep writing `ws:accept/5' etc.
+  {pkg_name, "erlang_ws"},
+  {licenses, ["Apache-2.0"]},
+  {links, [{"GitHub", "https://github.com/benoitc/erlang_ws"},
+           {"Changelog", "https://hexdocs.pm/erlang_ws/changelog.html"}]},
+  {files, ["src", "include", "examples",
+           "rebar.config", "rebar.lock",
+           "LICENSE", "README.md", "CHANGELOG.md"]}
+ ]}.
