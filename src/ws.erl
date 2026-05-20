@@ -28,7 +28,9 @@
 -type handle() :: term().
 
 -type accept_opts() :: #{
-    parser_opts => map()
+    parser_opts   => map(),
+    idle_timeout  => timeout(),
+    close_timeout => timeout()
 }.
 
 -export_type([transport_mod/0, handle/0, accept_opts/0]).

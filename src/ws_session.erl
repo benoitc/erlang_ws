@@ -50,7 +50,9 @@
     handler_mod :: module(),
     handler_state :: term(),
     close_sent = false :: boolean(),
-    close_received = false :: boolean()
+    close_received = false :: boolean(),
+    idle_timeout = ?WS_DEFAULT_IDLE_TIMEOUT   :: timeout(),
+    close_timeout = ?WS_DEFAULT_CLOSE_TIMEOUT :: timeout()
 }).
 
 -type start_opts() :: #{
@@ -60,7 +62,9 @@
     handler   := module(),
     handler_opts => term(),
     req       => map(),
-    parser_opts => map()
+    parser_opts => map(),
+    idle_timeout => timeout(),
+    close_timeout => timeout()
 }.
 
 -export_type([start_opts/0]).
@@ -107,20 +111,23 @@ init(#{transport := TM, handle := H, role := Role,
     Parser = ws_frame:init_parser(ParserOpts#{role => Role}),
     HOpts = maps:get(handler_opts, Opts, #{}),
     Req = maps:get(req, Opts, #{}),
+    St0 = #st{transport_mod = TM, handle = H, role = Role,
+              parser = Parser, handler_mod = HMod,
+              idle_timeout = maps:get(idle_timeout, Opts,
+                                      ?WS_DEFAULT_IDLE_TIMEOUT),
+              close_timeout = maps:get(close_timeout, Opts,
+                                       ?WS_DEFAULT_CLOSE_TIMEOUT)},
     case HMod:init(Req, HOpts) of
         {ok, HState} ->
-            post_init(TM, H, Role, Parser, HMod, HState, []);
+            post_init(St0#st{handler_state = HState}, []);
         {reply, Frames, HState} ->
-            post_init(TM, H, Role, Parser, HMod, HState, frames(Frames));
+            post_init(St0#st{handler_state = HState}, frames(Frames));
         {stop, Reason} ->
             _ = TM:close(H),
             {stop, Reason}
     end.
 
-post_init(TM, H, Role, Parser, HMod, HState, Frames) ->
-    St = #st{transport_mod = TM, handle = H, role = Role,
-             parser = Parser, handler_mod = HMod,
-             handler_state = HState},
+post_init(St, Frames) ->
     case send_frames(Frames, St) of
         {ok, St2} ->
             %% Defer activation until the embedder calls
@@ -139,7 +146,7 @@ post_init(TM, H, Role, Parser, HMod, HState, Frames) ->
 
 ready_wait(cast, activate, St = #st{transport_mod = TM, handle = H}) ->
     ok = TM:activate(H),
-    {next_state, open, St};
+    {next_state, open, St, idle_action(St)};
 ready_wait(cast, {send, Frames}, St) ->
     case send_frames(Frames, St) of
         {ok, St2} -> {keep_state, St2};
@@ -189,7 +196,10 @@ open(cast, {send, Frames}, St) ->
         {error, Reason} -> {stop, Reason, St}
     end;
 open(cast, {close, Code, Reason}, St) ->
-    initiate_close(Code, Reason, St).
+    initiate_close(Code, Reason, St);
+open({timeout, idle}, idle, St) ->
+    %% No inbound frame within `idle_timeout': close politely (1001).
+    initiate_close(?WS_CLOSE_GOING_AWAY, <<>>, St).
 
 %% --- closing state ----------------------------------------------------
 %%
@@ -212,6 +222,9 @@ closing(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P}) ->
         ignore ->
             keep_state_and_data
     end;
+closing(state_timeout, close, St) ->
+    %% Peer never completed the close handshake within `close_timeout'.
+    finish_close(St);
 closing(cast, {send, _}, _St) ->
     keep_state_and_data;
 closing(cast, {close, _C, _R}, _St) ->
@@ -285,11 +298,23 @@ close_echo(Code) ->
 
 initiate_close(Code, Reason, St = #st{close_sent = false}) ->
     case send_frames([{close, Code, Reason}], St#st{close_sent = true}) of
-        {ok, St2} -> {next_state, closing, St2};
+        {ok, St2} -> {next_state, closing, St2, closing_actions(St2)};
         {error, R} -> {stop, R, St}
     end;
 initiate_close(_C, _R, St) ->
     {keep_state, St}.
+
+%% Idle timer: a generic named timer so it survives unrelated events and
+%% is reset only when we choose (on inbound activity). `[]' disables it.
+idle_action(#st{idle_timeout = infinity}) -> [];
+idle_action(#st{idle_timeout = T})        -> [{{timeout, idle}, T, idle}].
+
+%% Entering `closing': cancel the idle timer and arm the close-handshake
+%% timeout so a silent peer cannot pin the session open forever.
+closing_actions(#st{close_timeout = infinity}) ->
+    [{{timeout, idle}, cancel}];
+closing_actions(#st{close_timeout = T}) ->
+    [{{timeout, idle}, cancel}, {state_timeout, T, close}].
 
 abort_with_close(Code, Reason, St) ->
     _ = send_frames([{close, Code, io_code_reason(Reason)}], St),
@@ -308,7 +333,7 @@ close_code_for(_)               -> ?WS_CLOSE_PROTOCOL_ERROR.
 reactivate(St = #st{transport_mod = TM, handle = H}, StateName) ->
     _ = TM:activate(H),
     case StateName of
-        open    -> {keep_state, St};
+        open    -> {keep_state, St, idle_action(St)};
         closing -> {keep_state, St}
     end.
 

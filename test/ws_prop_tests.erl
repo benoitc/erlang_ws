@@ -69,6 +69,20 @@ prop_chunked_delivery_preserves_messages() ->
                 One =:= Acc
             end).
 
+prop_text_arbitrary_bytes_never_crashes() ->
+    %% Arbitrary (often invalid UTF-8) bytes carried in a text frame must
+    %% decode to {ok, _} or {error, _}, never raise. Regression for the
+    %% UTF-8 DFA crashing on a non-continuation byte mid-sequence.
+    ?FORALL(Bytes, payload(),
+            begin
+                P = ws_frame:init_parser(#{role => server}),
+                Bin = iolist_to_binary(ws_frame:encode({text, Bytes}, client)),
+                case ws_frame:parse(P, Bin) of
+                    {ok, _, _}    -> true;
+                    {error, _, _} -> true
+                end
+            end).
+
 %% --- helpers ----------------------------------------------------------
 
 normalize({text, P})     -> {text, iolist_to_binary(P)};

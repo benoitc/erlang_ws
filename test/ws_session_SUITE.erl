@@ -21,8 +21,10 @@
          server_initiated_close/1,
          fragmented_text/1,
          bad_utf8_text/1,
+         bad_utf8_lead_then_ascii/1,
          oversize_frame/1,
-         handler_info_send/1]).
+         handler_info_send/1,
+         idle_timeout_closes_session/1]).
 
 all() ->
     [echo_text,
@@ -33,8 +35,10 @@ all() ->
      server_initiated_close,
      fragmented_text,
      bad_utf8_text,
+     bad_utf8_lead_then_ascii,
      oversize_frame,
-     handler_info_send].
+     handler_info_send,
+     idle_timeout_closes_session].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(ws),
@@ -120,6 +124,26 @@ bad_utf8_text(Config) ->
     send_raw(Sock, <<1:1, 0:3, 1:4, 1:1, 4:7, MaskKey:32, Bad/binary>>),
     %% Server must respond with a close frame code 1007 and close the socket.
     {close, 1007, _} = recv_frame(Sock),
+    _ = recv_eof(Sock),
+    ok.
+
+bad_utf8_lead_then_ascii(Config) ->
+    %% A multi-byte lead followed by an ASCII byte is invalid UTF-8 and
+    %% must close with 1007 (regression: this used to crash the session).
+    {ok, Sock} = connect(Config),
+    MaskKey = 16#00000000,
+    Bad = ws_frame:mask(<<16#C2, 16#41>>, MaskKey),
+    send_raw(Sock, <<1:1, 0:3, 1:4, 1:1, 2:7, MaskKey:32, Bad/binary>>),
+    {close, 1007, _} = recv_frame(Sock),
+    _ = recv_eof(Sock),
+    ok.
+
+idle_timeout_closes_session(Config) ->
+    %% No inbound frame within idle_timeout: server closes with 1001 and
+    %% (close_timeout being short too) drops the socket without an echo.
+    {ok, Sock} = connect_with(Config,
+        #{idle_timeout => 300, close_timeout => 300}),
+    {close, 1001, _} = recv_frame(Sock),
     _ = recv_eof(Sock),
     ok.
 
@@ -228,7 +252,7 @@ listener_loop(Listen, TestPid, Opts) ->
 handle_accepted(Sock, TestPid, Opts) ->
     TransportMod = ws_transport_gen_tcp,
     HandlerOpts = #{mode => echo, notify => TestPid},
-    AcceptOpts = maps:with([parser_opts], Opts),
+    AcceptOpts = maps:with([parser_opts, idle_timeout, close_timeout], Opts),
     case ws:accept(TransportMod, Sock, #{}, ws_test_handler,
                    HandlerOpts, AcceptOpts) of
         {ok, Pid} ->

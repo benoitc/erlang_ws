@@ -282,6 +282,18 @@ ws:connect(Url,
 Exceeding `max_frame` aborts the session with close code **1009
 Message Too Big** and closes the socket.
 
+The session also enforces two timeouts, set through the same options
+map on `ws:accept/6` / `ws:connect/2` (and `ws_h1_tcp_server:start_link/1`).
+Both accept `infinity` to disable:
+
+- `idle_timeout` (default 60000 ms), reset on every inbound frame. On
+  expiry the session closes with **1001 Going Away**. Long-lived idle
+  connections should send periodic pings or set
+  `idle_timeout => infinity`.
+- `close_timeout` (default 5000 ms): once the session has sent a close
+  frame, how long it waits for the peer's close echo before dropping
+  the socket.
+
 ## Bringing your own HTTP layer
 
 `ws_h1_tcp_server` is a reference. Real embedders wire `ws:accept/5`

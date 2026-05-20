@@ -37,7 +37,9 @@
     timeout            => timeout(),
     max_handshake_size => pos_integer(),
     ssl_opts           => list(),
-    parser_opts        => map()
+    parser_opts        => map(),
+    idle_timeout       => timeout(),
+    close_timeout      => timeout()
 }.
 
 %% Default guard against a peer that feeds us bytes but never
@@ -80,17 +82,41 @@ parse_rest(Scheme, Rest, DefaultPort) ->
             [HP] -> {HP, <<"/">>};
             [HP, Rem] -> {HP, <<"/", Rem/binary>>}
         end,
-    {Host, Port} = case binary:split(HostPort, <<":">>) of
-        [H] -> {H, DefaultPort};
-        [H, P] -> {H, binary_to_integer(P)}
-    end,
-    {ok, Scheme, Host, Port, Path}.
+    case split_host_port(HostPort, DefaultPort) of
+        {ok, Host, Port} -> {ok, Scheme, Host, Port, Path};
+        {error, _} = E   -> E
+    end.
+
+%% Split the authority into host + port. Supports IPv6 literals in
+%% brackets (`[::1]', `[::1]:8080') and returns the bare host (no
+%% brackets) for the connect call. A non-numeric port is a typed error
+%% rather than a crash.
+split_host_port(<<"[", Rest/binary>>, DefaultPort) ->
+    case binary:split(Rest, <<"]">>) of
+        [Addr, <<>>]              -> {ok, Addr, DefaultPort};
+        [Addr, <<":", P/binary>>] -> with_port(Addr, P);
+        _                         -> {error, invalid_url}
+    end;
+split_host_port(HostPort, DefaultPort) ->
+    case binary:split(HostPort, <<":">>) of
+        [H]    -> {ok, H, DefaultPort};
+        [H, P] -> with_port(H, P);
+        _      -> {error, invalid_url}
+    end.
+
+with_port(Host, PortBin) ->
+    try binary_to_integer(PortBin) of
+        Port when Port >= 0, Port =< 65535 -> {ok, Host, Port};
+        _ -> {error, {invalid_port, PortBin}}
+    catch
+        _:_ -> {error, {invalid_port, PortBin}}
+    end.
 
 %% ---------------------------------------------------------------------
 %% Dial + upgrade
 
 dial(ws, Host, Port, _Opts, Timeout) ->
-    case gen_tcp:connect(binary_to_list(Host), Port,
+    case gen_tcp:connect(host_arg(Host), Port,
                          [binary, {active, false}, {packet, 0}], Timeout) of
         {ok, Sock} -> {ok, ws_transport_gen_tcp, Sock};
         Err -> Err
@@ -101,9 +127,18 @@ dial(wss, Host, Port, Opts, Timeout) ->
                 {cacerts, public_key:cacerts_get()},
                 {server_name_indication, binary_to_list(Host)}],
     SslOpts = merge_ssl_opts(BaseOpts, maps:get(ssl_opts, Opts, [])),
-    case ssl:connect(binary_to_list(Host), Port, SslOpts, Timeout) of
+    case ssl:connect(host_arg(Host), Port, SslOpts, Timeout) of
         {ok, Sock} -> {ok, ws_transport_ssl, Sock};
         Err -> Err
+    end.
+
+%% An IP literal (v4 or v6) is passed as a parsed address tuple so the
+%% socket layer infers the right family; a hostname is resolved by name.
+host_arg(Host) ->
+    HostStr = binary_to_list(Host),
+    case inet:parse_address(HostStr) of
+        {ok, Addr}  -> Addr;
+        {error, _}  -> HostStr
     end.
 
 merge_ssl_opts(Base, User) ->
@@ -153,15 +188,17 @@ start_session(Transport, Handle, Info, Opts) ->
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
     ParserOpts = maps:get(parser_opts, Opts, #{}),
     Req = #{response => Info},
-    StartOpts = #{
-        transport    => Transport,
-        handle       => Handle,
-        role         => client,
-        handler      => HandlerMod,
-        handler_opts => HandlerOpts,
-        req          => Req,
-        parser_opts  => ParserOpts
-    },
+    StartOpts = maps:merge(
+        maps:with([idle_timeout, close_timeout], Opts),
+        #{
+            transport    => Transport,
+            handle       => Handle,
+            role         => client,
+            handler      => HandlerMod,
+            handler_opts => HandlerOpts,
+            req          => Req,
+            parser_opts  => ParserOpts
+        }),
     case ws_session:start_link(StartOpts) of
         {ok, Pid} ->
             case Transport:controlling_process(Handle, Pid) of

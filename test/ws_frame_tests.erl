@@ -273,3 +273,40 @@ roundtrip_server_to_client_test() ->
     Bin = iolist_to_binary(ws_frame:encode(Frame, server)),
     {ok, [Got], _} = ws_frame:parse(client_parser(), Bin),
     ?assertEqual(Frame, Got).
+
+%% ---------------------------------------------------------------------
+%% Invalid UTF-8 regressions: a non-continuation byte in the middle of a
+%% multi-byte sequence must be rejected, not crash the parser.
+
+decode_text_lead_then_ascii_is_invalid_test_() ->
+    [?_assertMatch({error, invalid_utf8, _},
+                   ws_frame:parse(server_parser(),
+                                  client_send({text, <<Lead, $A>>})))
+     || Lead <- [16#C2, 16#E0, 16#F0]].
+
+decode_fragmented_lead_then_ascii_is_invalid_test() ->
+    %% text FIN=0 with a 2-byte lead, then cont FIN=1 with an ASCII byte.
+    F1 = <<0:1, 0:3, 1:4, 1:1, 1:7, 0:32, 16#C2>>,
+    F2 = <<1:1, 0:3, 0:4, 1:1, 1:7, 0:32, 16#41>>,
+    {ok, [], P1} = ws_frame:parse(server_parser(), F1),
+    ?assertMatch({error, invalid_utf8, _}, ws_frame:parse(P1, F2)).
+
+%% ---------------------------------------------------------------------
+%% Close reason length cap.
+
+encode_close_truncates_long_reason_test() ->
+    Long = binary:copy(<<"x">>, 300),
+    Bin = iolist_to_binary(ws_frame:encode({close, 1000, Long}, server)),
+    <<16#88, Len, _Code:16, Reason/binary>> = Bin,
+    ?assert(Len =< 125),
+    ?assertEqual(123, byte_size(Reason)),
+    ?assertEqual(binary:copy(<<"x">>, 123), Reason).
+
+encode_close_truncates_on_utf8_boundary_test() ->
+    %% A 2-byte codepoint straddling the 123-byte cut is dropped whole,
+    %% leaving the reason valid UTF-8.
+    Reason = <<(binary:copy(<<"a">>, 122))/binary, "©"/utf8>>,
+    Bin = iolist_to_binary(ws_frame:encode({close, 1000, Reason}, server)),
+    {ok, [{close, 1000, Got}], _} = ws_frame:parse(client_parser(), Bin),
+    ?assert(byte_size(Got) =< 123),
+    ?assertEqual(Got, unicode:characters_to_binary(Got)).
