@@ -384,8 +384,7 @@ encode(close, server) ->
 encode(close, client) ->
     <<1:1, 0:3, ?WS_OP_CLOSE:4, 1:1, 0:39>>;
 encode({close, Code, Reason}, Role) ->
-    Bin = iolist_to_binary([<<Code:16>>, Reason]),
-    true = byte_size(Bin) =< 125,
+    Bin = iolist_to_binary([<<Code:16>>, truncate_close_reason(Reason)]),
     encode_masked_or_plain(Role, ?WS_OP_CLOSE, Bin);
 encode({ping, Payload}, Role) ->
     Bin = iolist_to_binary(Payload),
@@ -416,6 +415,29 @@ rand_mask_key() ->
 payload_length_bits(N) when N =< 125 -> <<N:7>>;
 payload_length_bits(N) when N =< 16#ffff -> <<126:7, N:16>>;
 payload_length_bits(N) when N =< 16#7fffffffffffffff -> <<127:7, N:64>>.
+
+%% A close payload is at most 125 bytes: 2-byte code + 123-byte reason.
+%% Cap the reason instead of crashing on an over-long one, and back off
+%% to a codepoint boundary so a truncated valid-UTF-8 reason stays valid.
+truncate_close_reason(Reason) ->
+    Bin = iolist_to_binary(Reason),
+    case byte_size(Bin) =< 123 of
+        true  -> Bin;
+        false ->
+            <<Cut:123/binary, _/binary>> = Bin,
+            trim_incomplete_utf8(Cut)
+    end.
+
+trim_incomplete_utf8(<<>>) -> <<>>;
+trim_incomplete_utf8(Bin) ->
+    case v_text(Bin, 0) of
+        0 -> Bin;   %% complete + valid
+        1 -> Bin;   %% already invalid UTF-8; leave as-is, just don't crash
+        _ ->        %% ends mid-codepoint: drop the trailing partial byte
+            Sz = byte_size(Bin) - 1,
+            <<Shorter:Sz/binary, _>> = Bin,
+            trim_incomplete_utf8(Shorter)
+    end.
 
 %% ---------------------------------------------------------------------
 %% UTF-8 validation (Hoehrmann DFA).
@@ -468,46 +490,53 @@ v_s0(<<C, R/bits>>) when C >= 128 ->
 v_s0(Text) ->
     v_ascii(Text).
 
-v_s2(<<C, R/bits>>) ->
+v_s2(<<C, R/bits>>) when C >= 128 ->
     case element(C - 127, utf8_class()) of
         7 -> v_s0(R); 1 -> v_s0(R); 9 -> v_s0(R); _ -> 1
     end;
+v_s2(<<_, _/bits>>) -> 1;
 v_s2(<<>>) -> 2.
 
-v_s3(<<C, R/bits>>) ->
+v_s3(<<C, R/bits>>) when C >= 128 ->
     case element(C - 127, utf8_class()) of
         7 -> v_s2(R); 1 -> v_s2(R); 9 -> v_s2(R); _ -> 1
     end;
+v_s3(<<_, _/bits>>) -> 1;
 v_s3(<<>>) -> 3.
 
-v_s4(<<C, R/bits>>) ->
+v_s4(<<C, R/bits>>) when C >= 128 ->
     case element(C - 127, utf8_class()) of
         7 -> v_s2(R); _ -> 1
     end;
+v_s4(<<_, _/bits>>) -> 1;
 v_s4(<<>>) -> 4.
 
-v_s5(<<C, R/bits>>) ->
+v_s5(<<C, R/bits>>) when C >= 128 ->
     case element(C - 127, utf8_class()) of
         1 -> v_s2(R); 9 -> v_s2(R); _ -> 1
     end;
+v_s5(<<_, _/bits>>) -> 1;
 v_s5(<<>>) -> 5.
 
-v_s6(<<C, R/bits>>) ->
+v_s6(<<C, R/bits>>) when C >= 128 ->
     case element(C - 127, utf8_class()) of
         7 -> v_s3(R); 9 -> v_s3(R); _ -> 1
     end;
+v_s6(<<_, _/bits>>) -> 1;
 v_s6(<<>>) -> 6.
 
-v_s7(<<C, R/bits>>) ->
+v_s7(<<C, R/bits>>) when C >= 128 ->
     case element(C - 127, utf8_class()) of
         7 -> v_s3(R); 1 -> v_s3(R); 9 -> v_s3(R); _ -> 1
     end;
+v_s7(<<_, _/bits>>) -> 1;
 v_s7(<<>>) -> 7.
 
-v_s8(<<C, R/bits>>) ->
+v_s8(<<C, R/bits>>) when C >= 128 ->
     case element(C - 127, utf8_class()) of
         1 -> v_s3(R); _ -> 1
     end;
+v_s8(<<_, _/bits>>) -> 1;
 v_s8(<<>>) -> 8.
 
 -compile({inline, [utf8_class/0]}).

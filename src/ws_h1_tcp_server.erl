@@ -54,7 +54,9 @@
     tls                => [term()],
     parser_opts        => map(),
     timeout            => timeout(),
-    max_handshake_size => pos_integer()
+    max_handshake_size => pos_integer(),
+    idle_timeout       => timeout(),
+    close_timeout      => timeout()
 }.
 
 %% Default guard against unbounded pre-upgrade read.
@@ -205,8 +207,10 @@ start_session(Transport, Handle, Method, Path, Hdrs, Info, Rest, Opts) ->
             path => Path,
             headers => Hdrs,
             upgrade_info => Info},
+    AcceptOpts = maps:merge(maps:with([idle_timeout, close_timeout], Opts),
+                            #{parser_opts => ParserOpts}),
     case ws:accept(Transport, Handle, Req, HandlerMod, HandlerOpts,
-                   #{parser_opts => ParserOpts}) of
+                   AcceptOpts) of
         {ok, Pid} ->
             case Rest of
                 <<>> -> ok;

@@ -15,12 +15,18 @@
 
 -export([client_handshake_and_echo/1,
          client_ping_gets_pong/1,
-         client_close_roundtrip/1]).
+         client_close_roundtrip/1,
+         connect_bad_port_is_error/1,
+         connect_ipv6_loopback/1,
+         close_timeout_finishes_session/1]).
 
 all() ->
     [client_handshake_and_echo,
      client_ping_gets_pong,
-     client_close_roundtrip].
+     client_close_roundtrip,
+     connect_bad_port_is_error,
+     connect_ipv6_loopback,
+     close_timeout_finishes_session].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(ws),
@@ -60,6 +66,53 @@ client_close_roundtrip(Config) ->
     %% Session terminates after exchanging close frames.
     ok = wait_for_session_exit(Pid, 2000).
 
+connect_bad_port_is_error(_Config) ->
+    %% Non-numeric port is a typed error, not a crash. The parse fails
+    %% before any socket call, so no listener is needed.
+    ?assertMatch({error, {invalid_port, _}},
+                 ws_client:connect(<<"ws://127.0.0.1:notaport/">>,
+                     #{handler => client_forwarder_handler,
+                       handler_opts => #{notify => self()}})).
+
+connect_ipv6_loopback(_Config) ->
+    case start_listener_ip(self(), {0,0,0,0,0,0,0,1}) of
+        {error, Reason} ->
+            {skip, {no_ipv6_loopback, Reason}};
+        {Listener, Port} ->
+            try
+                Url = iolist_to_binary(["ws://[::1]:",
+                                        integer_to_list(Port), "/"]),
+                {ok, Pid} = ws_client:connect(Url,
+                    #{handler => client_forwarder_handler,
+                      handler_opts => #{notify => self()}}),
+                ws_session:send(Pid, {text, <<"v6">>}),
+                {text, <<"v6">>} = wait_for_frame(2000),
+                ok = ws_session:stop(Pid)
+            after
+                catch exit(Listener, shutdown)
+            end
+    end.
+
+close_timeout_finishes_session(_Config) ->
+    %% Peer completes the handshake then goes silent (never echoes our
+    %% close). The client must still exit within close_timeout.
+    {Listener, Port} = start_silent_listener(),
+    try
+        Url = iolist_to_binary(["ws://127.0.0.1:",
+                                integer_to_list(Port), "/"]),
+        {ok, Pid} = ws_client:connect(Url,
+            #{handler => client_forwarder_handler,
+              handler_opts => #{notify => self()},
+              close_timeout => 300}),
+        MRef = erlang:monitor(process, Pid),
+        ws:close(Pid, 1000, <<"bye">>),
+        receive {'DOWN', MRef, process, Pid, _} -> ok
+        after 2000 -> error(session_did_not_exit)
+        end
+    after
+        Listener ! stop
+    end.
+
 %% ---------------------------------------------------------------------
 %% Helpers
 
@@ -95,6 +148,47 @@ start_listener(ParentPid) ->
         {ok, P} = inet:port(Listen),
         Parent ! {ready, P},
         listener_loop(Listen, ParentPid)
+    end),
+    Port = receive {ready, P} -> P after 2000 -> error(listener_not_ready) end,
+    {Pid, Port}.
+
+%% Echo listener bound to a specific IP (used for the IPv6 case). Returns
+%% {error, Reason} when the bind fails, e.g. no IPv6 loopback present.
+start_listener_ip(ParentPid, IP) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Pid = spawn(fun() ->
+        case gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true},
+                                {packet, 0}, {ip, IP}]) of
+            {ok, Listen} ->
+                {ok, P} = inet:port(Listen),
+                Parent ! {Ref, {ok, P}},
+                listener_loop(Listen, ParentPid);
+            {error, _} = E ->
+                Parent ! {Ref, E}
+        end
+    end),
+    receive
+        {Ref, {ok, Port}}     -> {Pid, Port};
+        {Ref, {error, _} = E} -> E
+    after 2000 -> {error, timeout}
+    end.
+
+%% Listener that completes the handshake on one connection then stays
+%% silent, holding the socket open until told to stop.
+start_silent_listener() ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        {ok, Listen} = gen_tcp:listen(0,
+            [binary, {active, false}, {reuseaddr, true}, {packet, 0}]),
+        {ok, Port} = inet:port(Listen),
+        Parent ! {ready, Port},
+        {ok, Sock} = gen_tcp:accept(Listen, 2000),
+        {ok, _M, _P, Hdrs, _Rest} = read_request(Sock, <<>>, 2000),
+        {ok, Info} = ws_h1_upgrade:validate_request(Hdrs),
+        ok = gen_tcp:send(Sock, format_response(101,
+                 ws_h1_upgrade:response_headers(Info))),
+        receive stop -> gen_tcp:close(Sock) end
     end),
     Port = receive {ready, P} -> P after 2000 -> error(listener_not_ready) end,
     {Pid, Port}.

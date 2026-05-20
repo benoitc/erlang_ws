@@ -31,6 +31,13 @@
 -define(WS_DEFAULT_MAX_FRAME_SIZE,   (16 * 1024 * 1024)). %% 16 MiB
 -define(WS_DEFAULT_MAX_MESSAGE_SIZE, (64 * 1024 * 1024)). %% 64 MiB
 
+%% Session timeouts (ms). `idle_timeout' bounds inactivity on an open
+%% connection (reset on each inbound frame); `close_timeout' bounds the
+%% wait for the peer's close echo once we have sent a close. Both accept
+%% `infinity' to disable. Set via session options.
+-define(WS_DEFAULT_IDLE_TIMEOUT,  60000).
+-define(WS_DEFAULT_CLOSE_TIMEOUT, 5000).
+
 %% Parser state carried between frame decode calls. Holds partial
 %% bytes and the current fragmented-message accumulator.
 -record(ws_parser, {

@@ -219,11 +219,22 @@ build_request(Host, Port, _Path, Opts) ->
     {Key, Hdrs}.
 
 format_host(Host, Port) when is_integer(Port) ->
-    <<Host/binary, ":", (integer_to_binary(Port))/binary>>;
+    H = maybe_bracket(Host),
+    <<H/binary, ":", (integer_to_binary(Port))/binary>>;
 format_host(Host, Port) when is_binary(Port), Port =/= <<>> ->
-    <<Host/binary, ":", Port/binary>>;
+    H = maybe_bracket(Host),
+    <<H/binary, ":", Port/binary>>;
 format_host(Host, _) ->
-    Host.
+    maybe_bracket(Host).
+
+%% Bracket an IPv6 literal (`::1' -> `[::1]') for the Host header, per
+%% RFC 3986. Hostnames and already-bracketed literals are unchanged.
+maybe_bracket(<<"[", _/binary>> = Host) -> Host;
+maybe_bracket(Host) ->
+    case binary:match(Host, <<":">>) of
+        nomatch -> Host;
+        _       -> <<"[", Host/binary, "]">>
+    end.
 
 -spec validate_response(integer(), headers()) ->
     {ok, #{accept := binary(), subprotocol => binary(), extensions => [binary()]}}

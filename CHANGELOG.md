@@ -4,6 +4,30 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- `ws_frame` UTF-8 validation no longer crashes on a non-continuation
+  byte in the middle of a multi-byte sequence (e.g. `0xC2 0x41`). Such
+  input is now reported as `invalid_utf8` so the session closes with
+  code 1007 instead of the process crashing with `badarg`.
+- `ws_session` now enforces an `idle_timeout` (default 60000 ms) on open
+  connections and a `close_timeout` (default 5000 ms) while awaiting the
+  peer's close echo. A stalled peer can no longer hold a session and
+  socket open indefinitely. Both accept `infinity` to disable and are
+  configurable via `ws:accept/6`, `ws:connect/2`, and
+  `ws_h1_tcp_server:start_link/1`. Note: long-lived idle connections now
+  require app-level pings or `idle_timeout => infinity`.
+
+### Fixes
+
+- `ws_client:connect/2` returns `{error, {invalid_port, _}}` for a
+  non-numeric URL port instead of crashing, and accepts IPv6 literal
+  hosts such as `ws://[::1]:8080/`.
+- `ws_frame:encode/2` caps an over-long close reason (> 123 bytes) on a
+  UTF-8 codepoint boundary instead of crashing.
+
 ## [0.1.1] — 2026-04-19
 
 ### Security
