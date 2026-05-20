@@ -1,6 +1,6 @@
 {application, ws,
  [{description, "WebSocket protocol library for Erlang (RFC 6455 / RFC 8441 / RFC 9220)"},
-  {vsn, "0.1.1"},
+  {vsn, "0.2.0"},
   {registered, [ws_sup]},
   {mod, {ws_app, []}},
   {applications,

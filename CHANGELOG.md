@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-05-21
 
 ### Security
 
@@ -27,6 +27,8 @@ follow [Semantic Versioning](https://semver.org/).
   hosts such as `ws://[::1]:8080/`.
 - `ws_frame:encode/2` caps an over-long close reason (> 123 bytes) on a
   UTF-8 codepoint boundary instead of crashing.
+
+[0.2.0]: https://github.com/benoitc/erlang_ws/releases/tag/0.2.0
 
 ## [0.1.1] — 2026-04-19
 
