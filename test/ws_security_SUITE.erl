@@ -41,7 +41,7 @@ init_per_suite(Config) ->
     Config.
 
 end_per_suite(_Config) ->
-    catch application:stop(ws),
+    try application:stop(ws) catch _:_ -> ok end,
     ok.
 
 %% ---------------------------------------------------------------------

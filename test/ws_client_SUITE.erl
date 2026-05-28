@@ -40,7 +40,7 @@ init_per_testcase(_TC, Config) ->
     [{listener, Server}, {port, Port} | Config].
 
 end_per_testcase(_TC, Config) ->
-    catch exit(?config(listener, Config), shutdown),
+    try exit(?config(listener, Config), shutdown) catch _:_ -> ok end,
     ok.
 
 %% ---------------------------------------------------------------------
@@ -89,7 +89,7 @@ connect_ipv6_loopback(_Config) ->
                 {text, <<"v6">>} = wait_for_frame(2000),
                 ok = ws_session:stop(Pid)
             after
-                catch exit(Listener, shutdown)
+                try exit(Listener, shutdown) catch _:_ -> ok end
             end
     end.
 

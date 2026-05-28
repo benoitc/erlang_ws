@@ -53,8 +53,8 @@ init_per_testcase(_TC, Config) ->
 
 end_per_testcase(_TC, Config) ->
     Pid = ?config(listener, Config),
-    catch unlink(Pid),
-    catch exit(Pid, shutdown),
+    try unlink(Pid) catch _:_ -> ok end,
+    try exit(Pid, shutdown) catch _:_ -> ok end,
     ok.
 
 %% ---------------------------------------------------------------------

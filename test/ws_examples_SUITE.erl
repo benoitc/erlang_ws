@@ -65,7 +65,7 @@ end_per_suite(Config) ->
         Pid when is_pid(Pid) -> Pid ! stop;
         _ -> ok
     end,
-    catch application:stop(ws),
+    try application:stop(ws) catch _:_ -> ok end,
     ok.
 
 init_per_testcase(_TC, Config) -> Config.
