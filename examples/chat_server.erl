@@ -60,7 +60,7 @@ handle_info(_, State) ->
     {ok, State}.
 
 terminate(_Reason, _State) ->
-    _ = (catch pg:leave(?GROUP, self())),
+    _ = (try pg:leave(?GROUP, self()) catch _:_ -> ok end),
     ok.
 
 %% --- helpers ---------------------------------------------------------

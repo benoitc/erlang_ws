@@ -39,7 +39,7 @@ init_per_suite(Config) ->
     end.
 
 end_per_suite(_Config) ->
-    (catch application:stop(ws)),
+    try application:stop(ws) catch _:_ -> ok end,
     ok.
 
 autobahn_core_suites(Config) ->
@@ -53,7 +53,7 @@ autobahn_core_suites(Config) ->
         run_autobahn(Spec, ReportDir),
         assert_report_clean(ReportDir)
     after
-        catch exit(Listener, shutdown)
+        try exit(Listener, shutdown) catch _:_ -> ok end
     end.
 
 %% ---------------------------------------------------------------------
