@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-05-29
+
+### Changed
+
+- Ported to Erlang/OTP 29. Old-style `catch Expr` cleanup calls in the
+  test suites and examples are rewritten as `try ... catch _:_ -> ok end`
+  to satisfy OTP 29's `warn_deprecated_catch`. The library sources were
+  already free of old-style catch.
+- CI now tests OTP 28 and 29 (dropped 26 and 27) and uses rebar3 3.27.
+
+[0.3.0]: https://github.com/benoitc/erlang_ws/releases/tag/0.3.0
+
 ## [0.2.0] - 2026-05-21
 
 ### Security
