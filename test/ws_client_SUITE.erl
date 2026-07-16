@@ -16,6 +16,7 @@
 -export([client_handshake_and_echo/1,
          client_ping_gets_pong/1,
          client_close_roundtrip/1,
+         client_frame_coalesced_with_handshake/1,
          connect_bad_port_is_error/1,
          connect_ipv6_loopback/1,
          close_timeout_finishes_session/1]).
@@ -24,6 +25,7 @@ all() ->
     [client_handshake_and_echo,
      client_ping_gets_pong,
      client_close_roundtrip,
+     client_frame_coalesced_with_handshake,
      connect_bad_port_is_error,
      connect_ipv6_loopback,
      close_timeout_finishes_session].
@@ -65,6 +67,26 @@ client_close_roundtrip(Config) ->
     ws_session:close(Pid, 1000, <<"bye">>),
     %% Session terminates after exchanging close frames.
     ok = wait_for_session_exit(Pid, 2000).
+
+%% Regression: a server frame that arrives in the *same* TCP segment as
+%% the 101 response must not be lost. ws_client's read_response returns
+%% those trailing bytes as `Rest'; the session has to replay them.
+%% A gateway that greets the moment the upgrade completes sends its hello
+%% frame coalesced with the 101, so dropping `Rest' left the connection
+%% permanently silent.
+client_frame_coalesced_with_handshake(_Config) ->
+    {Listener, Port} = start_greeting_listener(<<"hi">>),
+    try
+        Url = iolist_to_binary(["ws://127.0.0.1:",
+                                integer_to_list(Port), "/"]),
+        {ok, Pid} = ws_client:connect(Url,
+            #{handler => client_forwarder_handler,
+              handler_opts => #{notify => self()}}),
+        ?assertEqual({text, <<"hi">>}, wait_for_frame(2000)),
+        ok = ws_session:stop(Pid)
+    after
+        Listener ! stop
+    end.
 
 connect_bad_port_is_error(_Config) ->
     %% Non-numeric port is a typed error, not a crash. The parse fails
@@ -188,6 +210,31 @@ start_silent_listener() ->
         {ok, Info} = ws_h1_upgrade:validate_request(Hdrs),
         ok = gen_tcp:send(Sock, format_response(101,
                  ws_h1_upgrade:response_headers(Info))),
+        receive stop -> gen_tcp:close(Sock) end
+    end),
+    Port = receive {ready, P} -> P after 2000 -> error(listener_not_ready) end,
+    {Pid, Port}.
+
+%% Completes the handshake and writes a text frame *in the same send* as
+%% the 101 response, then holds the socket open. This is what a server
+%% that greets immediately does; the single write guarantees the frame is
+%% coalesced into the client's first recv (the timing-dependent condition
+%% the original bug hid behind), so the regression is deterministic. The
+%% frame is built with the library's own encoder rather than hand-rolled.
+start_greeting_listener(Payload) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        {ok, Listen} = gen_tcp:listen(0,
+            [binary, {active, false}, {reuseaddr, true}, {packet, 0}]),
+        {ok, Port} = inet:port(Listen),
+        Parent ! {ready, Port},
+        {ok, Sock} = gen_tcp:accept(Listen, 2000),
+        {ok, _M, _P, Hdrs, _Rest} = read_request(Sock, <<>>, 2000),
+        {ok, Info} = ws_h1_upgrade:validate_request(Hdrs),
+        Resp = format_response(101, ws_h1_upgrade:response_headers(Info)),
+        Frame = ws_frame:encode({text, Payload}, server),
+        %% One write: the frame rides in the same segment as the 101.
+        ok = gen_tcp:send(Sock, [Resp, Frame]),
         receive stop -> gen_tcp:close(Sock) end
     end),
     Port = receive {ready, P} -> P after 2000 -> error(listener_not_ready) end,

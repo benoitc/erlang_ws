@@ -156,10 +156,16 @@ upgrade(Transport, Handle, Host, Port, Path, Opts, Timeout, MaxHs) ->
     case Transport:send(Handle, Request) of
         ok ->
             case read_response(Transport, Handle, Timeout, MaxHs) of
-                {ok, Status, RespHdrs, _Rest} ->
+                {ok, Status, RespHdrs, Rest} ->
                     case ws_h1_upgrade:validate_response(Status, RespHdrs) of
                         {ok, Info} ->
-                            verify_accept(Key, Info, Transport, Handle, Opts);
+                            %% `Rest' is any bytes that followed the 101 in
+                            %% the same recv — a server that greets the
+                            %% instant the upgrade completes coalesces its
+                            %% first frame there. It must reach the session,
+                            %% not be dropped, or the connection goes silent.
+                            verify_accept(Key, Info, Transport, Handle, Rest,
+                                          Opts);
                         Err ->
                             _ = Transport:close(Handle),
                             Err
@@ -173,17 +179,17 @@ upgrade(Transport, Handle, Host, Port, Path, Opts, Timeout, MaxHs) ->
             Err
     end.
 
-verify_accept(Key, Info, Transport, Handle, Opts) ->
+verify_accept(Key, Info, Transport, Handle, Rest, Opts) ->
     Expected = ws_h1_upgrade:accept_key(Key),
     case maps:get(accept, Info) of
         Expected ->
-            start_session(Transport, Handle, Info, Opts);
+            start_session(Transport, Handle, Info, Rest, Opts);
         _ ->
             _ = Transport:close(Handle),
             {error, sec_websocket_accept_mismatch}
     end.
 
-start_session(Transport, Handle, Info, Opts) ->
+start_session(Transport, Handle, Info, Rest, Opts) ->
     HandlerMod = maps:get(handler, Opts),
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
     ParserOpts = maps:get(parser_opts, Opts, #{}),
@@ -197,7 +203,10 @@ start_session(Transport, Handle, Info, Opts) ->
             handler      => HandlerMod,
             handler_opts => HandlerOpts,
             req          => Req,
-            parser_opts  => ParserOpts
+            parser_opts  => ParserOpts,
+            %% Bytes read past the 101 in the handshake recv — replayed by
+            %% the session before it reads more from the socket.
+            initial_data => Rest
         }),
     case ws_session:start_link(StartOpts) of
         {ok, Pid} ->

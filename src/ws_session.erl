@@ -52,7 +52,11 @@
     close_sent = false :: boolean(),
     close_received = false :: boolean(),
     idle_timeout = ?WS_DEFAULT_IDLE_TIMEOUT   :: timeout(),
-    close_timeout = ?WS_DEFAULT_CLOSE_TIMEOUT :: timeout()
+    close_timeout = ?WS_DEFAULT_CLOSE_TIMEOUT :: timeout(),
+    %% Bytes handed over by the embedder that arrived before the session
+    %% owned the socket (a client's handshake recv can coalesce the first
+    %% server frame with the 101). Replayed at activation, then cleared.
+    pending = <<>> :: binary()
 }).
 
 -type start_opts() :: #{
@@ -64,7 +68,8 @@
     req       => map(),
     parser_opts => map(),
     idle_timeout => timeout(),
-    close_timeout => timeout()
+    close_timeout => timeout(),
+    initial_data => binary()
 }.
 
 -export_type([start_opts/0]).
@@ -116,7 +121,8 @@ init(#{transport := TM, handle := H, role := Role,
               idle_timeout = maps:get(idle_timeout, Opts,
                                       ?WS_DEFAULT_IDLE_TIMEOUT),
               close_timeout = maps:get(close_timeout, Opts,
-                                       ?WS_DEFAULT_CLOSE_TIMEOUT)},
+                                       ?WS_DEFAULT_CLOSE_TIMEOUT),
+              pending = maps:get(initial_data, Opts, <<>>)},
     case HMod:init(Req, HOpts) of
         {ok, HState} ->
             post_init(St0#st{handler_state = HState}, []);
@@ -144,9 +150,17 @@ post_init(St, Frames) ->
 %% Frames can be queued via `send' while we wait; inbound bytes cannot
 %% arrive yet because the transport has not been activated.
 
-ready_wait(cast, activate, St = #st{transport_mod = TM, handle = H}) ->
+ready_wait(cast, activate, St = #st{transport_mod = TM, handle = H,
+                                    pending = <<>>}) ->
     ok = TM:activate(H),
     {next_state, open, St, idle_action(St)};
+ready_wait(cast, activate, St = #st{pending = Bin}) when Bin =/= <<>> ->
+    %% Bytes arrived coalesced with the handshake. Enter `open' and replay
+    %% them via an internal event, which is processed *before* any socket
+    %% message — so the transport is not activated (and cannot deliver new
+    %% bytes) until the drain has run, keeping the coalesced frame first.
+    {next_state, open, St#st{pending = <<>>},
+     [{next_event, internal, {drain, Bin}}]};
 ready_wait(cast, {send, Frames}, St) ->
     case send_frames(Frames, St) of
         {ok, St2} -> {keep_state, St2};
@@ -159,6 +173,18 @@ ready_wait(_EventType, _Msg, _St) ->
 
 %% --- open state -------------------------------------------------------
 
+%% Replay the bytes that were coalesced with the handshake, exactly as the
+%% `info' clause parses socket bytes. `dispatch_messages' ends in
+%% `reactivate', which arms the transport once — so a partial frame here
+%% simply waits for the rest to arrive from the socket.
+open(internal, {drain, Bin}, St = #st{parser = P}) ->
+    case ws_frame:parse(P, Bin) of
+        {ok, Messages, P2} ->
+            dispatch_messages(Messages, St#st{parser = P2}, open);
+        {error, Reason, P2} ->
+            abort_with_close(close_code_for(Reason), Reason,
+                             St#st{parser = P2})
+    end;
 open(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P,
                          handler_mod = HMod, handler_state = HState}) ->
     case TM:classify(Msg, H) of
