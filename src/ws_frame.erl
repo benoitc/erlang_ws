@@ -37,17 +37,23 @@
 
 -export([init_parser/0, init_parser/1]).
 -export([parse/2]).
--export([encode/2]).
+-export([encode/2, encode_compressed/2]).
 -export([mask/2]).
+-export([valid_utf8/1]).
 
 -export_type([parser/0, frame/0, message/0, role/0, error_reason/0]).
 
 -type role() :: client | server.
 -type parser() :: #ws_parser{}.
 
+%% `{compressed, _, _}' messages are only produced with the `compress'
+%% parser option (permessage-deflate negotiated); the payload is the
+%% raw deflate stream and, for text, NOT yet UTF-8 validated — the
+%% consumer validates after inflating.
 -type message() ::
       {text, binary()}
     | {binary, binary()}
+    | {compressed, text | binary, binary()}
     | {ping, binary()}
     | {pong, binary()}
     | {close, ws_close:code(), binary()}
@@ -79,7 +85,8 @@ init_parser(Opts) when is_map(Opts) ->
     #ws_parser{
         role       = maps:get(role, Opts, server),
         max_frame   = maps:get(max_frame,   Opts, ?WS_DEFAULT_MAX_FRAME_SIZE),
-        max_message = maps:get(max_message, Opts, ?WS_DEFAULT_MAX_MESSAGE_SIZE)
+        max_message = maps:get(max_message, Opts, ?WS_DEFAULT_MAX_MESSAGE_SIZE),
+        compress   = maps:get(compress, Opts, false)
     }.
 
 %% ---------------------------------------------------------------------
@@ -113,42 +120,53 @@ parse_one(P = #ws_parser{buffer = Buf, role = Role,
                          max_message = MaxMessage,
                          frag_op = FragOp,
                          frag_size = FragSize,
-                         utf8_state = Utf8In}) ->
-    case decode_header(Buf, Role, FragOp) of
+                         utf8_state = Utf8In,
+                         compress = Compress}) ->
+    case decode_header(Buf, Role, FragOp, Compress) of
         more ->
             more;
         {error, _} = E ->
             E;
-        {ok, _Fin, Opcode, Len, _Mask, _Rest} when Len > MaxFrame,
-                                                    Opcode < 8 ->
+        {ok, _Fin, _Rsv1, Opcode, Len, _Mask, _Rest} when Len > MaxFrame,
+                                                          Opcode < 8 ->
             {error, message_too_big};
-        {ok, _Fin, Opcode, Len, _Mask, _Rest} when Opcode >= 8, Len > 125 ->
+        {ok, _Fin, _Rsv1, Opcode, Len, _Mask, _Rest} when Opcode >= 8,
+                                                          Len > 125 ->
             {error, protocol_error};
-        {ok, Fin, Opcode, Len, Mask, Rest} ->
+        {ok, Fin, Rsv1, Opcode, Len, Mask, Rest} ->
             case byte_size(Rest) of
                 N when N < Len ->
                     more;
                 _ ->
                     <<Payload0:Len/binary, After/binary>> = Rest,
                     Payload = unmask(Payload0, Mask),
-                    handle_frame(P, Fin, Opcode, Payload, After,
+                    handle_frame(P, Fin, Rsv1 =:= 1, Opcode, Payload, After,
                                  FragSize, MaxMessage, Utf8In)
             end
     end.
 
 %% --- handle_frame -----------------------------------------------------
+%%
+%% The `Compressed' argument is RSV1 of the frame just decoded; it can
+%% only be true on the first frame of a data message (decode_header
+%% rejects it everywhere else). A compressed message skips inline UTF-8
+%% validation: the payload is a deflate stream, and the consumer
+%% validates the text after inflating.
 
-handle_frame(P, Fin, ?WS_OP_PING, Payload, After, _FragSize, _MaxMsg, _U) ->
+handle_frame(P, Fin, _Compressed, ?WS_OP_PING, Payload, After,
+             _FragSize, _MaxMsg, _U) ->
     case Fin of
         1 -> {ok, {ping, Payload}, P#ws_parser{buffer = After}};
         0 -> {error, protocol_error}
     end;
-handle_frame(P, Fin, ?WS_OP_PONG, Payload, After, _FragSize, _MaxMsg, _U) ->
+handle_frame(P, Fin, _Compressed, ?WS_OP_PONG, Payload, After,
+             _FragSize, _MaxMsg, _U) ->
     case Fin of
         1 -> {ok, {pong, Payload}, P#ws_parser{buffer = After}};
         0 -> {error, protocol_error}
     end;
-handle_frame(P, Fin, ?WS_OP_CLOSE, Payload, After, _FragSize, _MaxMsg, _U)
+handle_frame(P, Fin, _Compressed, ?WS_OP_CLOSE, Payload, After,
+             _FragSize, _MaxMsg, _U)
         when Fin =:= 1 ->
     case parse_close_payload(Payload) of
         close ->
@@ -158,22 +176,35 @@ handle_frame(P, Fin, ?WS_OP_CLOSE, Payload, After, _FragSize, _MaxMsg, _U)
         {error, _} = E ->
             E
     end;
-handle_frame(_P, 0, ?WS_OP_CLOSE, _Payload, _After, _FragSize, _MaxMsg, _U) ->
+handle_frame(_P, 0, _Compressed, ?WS_OP_CLOSE, _Payload, _After,
+             _FragSize, _MaxMsg, _U) ->
     {error, protocol_error};
 
 %% Text frame. Either final (fin=1) producing a full message, or the
 %% opening of a fragmented message.
-handle_frame(P = #ws_parser{}, 1, ?WS_OP_TEXT, Payload, After, _FS, _MaxMsg, _U) ->
+handle_frame(P = #ws_parser{}, 1, true, ?WS_OP_TEXT, Payload, After,
+             _FS, _MaxMsg, _U) ->
+    {ok, {compressed, text, Payload}, P#ws_parser{buffer = After}};
+handle_frame(P = #ws_parser{}, 1, false, ?WS_OP_TEXT, Payload, After,
+             _FS, _MaxMsg, _U) ->
     case validate_utf8(Payload, 0) of
         0 ->
             {ok, {text, Payload}, P#ws_parser{buffer = After}};
         _ ->
             {error, invalid_utf8}
     end;
-handle_frame(P = #ws_parser{}, 0, ?WS_OP_TEXT, Payload, After, _FS, MaxMsg, _U) ->
+handle_frame(P = #ws_parser{}, 0, Compressed, ?WS_OP_TEXT, Payload, After,
+             _FS, MaxMsg, _U) ->
     case byte_size(Payload) of
         N when N > MaxMsg ->
             {error, message_too_big};
+        N when Compressed ->
+            {fragment, P#ws_parser{
+                buffer = After,
+                frag_op = text,
+                frag_acc = [Payload],
+                frag_size = N,
+                frag_compressed = true}};
         N ->
             case validate_utf8_stream(Payload, 0) of
                 {error, _} = E -> E;
@@ -187,9 +218,14 @@ handle_frame(P = #ws_parser{}, 0, ?WS_OP_TEXT, Payload, After, _FS, MaxMsg, _U) 
             end
     end;
 
-handle_frame(P = #ws_parser{}, 1, ?WS_OP_BINARY, Payload, After, _FS, _MaxMsg, _U) ->
+handle_frame(P = #ws_parser{}, 1, true, ?WS_OP_BINARY, Payload, After,
+             _FS, _MaxMsg, _U) ->
+    {ok, {compressed, binary, Payload}, P#ws_parser{buffer = After}};
+handle_frame(P = #ws_parser{}, 1, false, ?WS_OP_BINARY, Payload, After,
+             _FS, _MaxMsg, _U) ->
     {ok, {binary, Payload}, P#ws_parser{buffer = After}};
-handle_frame(P = #ws_parser{}, 0, ?WS_OP_BINARY, Payload, After, _FS, MaxMsg, _U) ->
+handle_frame(P = #ws_parser{}, 0, Compressed, ?WS_OP_BINARY, Payload, After,
+             _FS, MaxMsg, _U) ->
     case byte_size(Payload) of
         N when N > MaxMsg ->
             {error, message_too_big};
@@ -199,21 +235,29 @@ handle_frame(P = #ws_parser{}, 0, ?WS_OP_BINARY, Payload, After, _FS, MaxMsg, _U
                 frag_op = binary,
                 frag_acc = [Payload],
                 frag_size = N,
+                frag_compressed = Compressed,
                 utf8_state = 0}}
     end;
 
-%% Continuation frames.
+%% Continuation frames. RSV1 on a continuation is rejected by
+%% decode_header, so `_Compressed' is always false here; the message's
+%% compressed flag lives in `frag_compressed'.
 handle_frame(P = #ws_parser{frag_op = FragOp, frag_acc = Acc, frag_size = FS,
-                            utf8_state = Utf8State}, 1, ?WS_OP_CONT,
-             Payload, After, _FS, MaxMsg, _U) when FragOp =/= undefined ->
+                            frag_compressed = FragCompressed,
+                            utf8_state = Utf8State}, 1, _Compressed,
+             ?WS_OP_CONT, Payload, After, _FS, MaxMsg, _U)
+        when FragOp =/= undefined ->
     NewSize = FS + byte_size(Payload),
     case NewSize of
         N when N > MaxMsg ->
             {error, message_too_big};
         _ ->
             Full = iolist_to_binary(lists:reverse([Payload | Acc])),
-            case FragOp of
-                text ->
+            case {FragOp, FragCompressed} of
+                {_, true} ->
+                    P2 = reset_fragment(P#ws_parser{buffer = After}),
+                    {ok, {compressed, FragOp, Full}, P2};
+                {text, false} ->
                     case validate_utf8(Payload, Utf8State) of
                         0 ->
                             P2 = reset_fragment(P#ws_parser{buffer = After}),
@@ -221,21 +265,28 @@ handle_frame(P = #ws_parser{frag_op = FragOp, frag_acc = Acc, frag_size = FS,
                         _ ->
                             {error, invalid_utf8}
                     end;
-                binary ->
+                {binary, false} ->
                     P2 = reset_fragment(P#ws_parser{buffer = After}),
                     {ok, {binary, Full}, P2}
             end
     end;
 handle_frame(P = #ws_parser{frag_op = FragOp, frag_acc = Acc, frag_size = FS,
-                            utf8_state = Utf8State}, 0, ?WS_OP_CONT,
-             Payload, After, _FS, MaxMsg, _U) when FragOp =/= undefined ->
+                            frag_compressed = FragCompressed,
+                            utf8_state = Utf8State}, 0, _Compressed,
+             ?WS_OP_CONT, Payload, After, _FS, MaxMsg, _U)
+        when FragOp =/= undefined ->
     NewSize = FS + byte_size(Payload),
     case NewSize of
         N when N > MaxMsg ->
             {error, message_too_big};
         _ ->
-            case FragOp of
-                text ->
+            case {FragOp, FragCompressed} of
+                {_, true} ->
+                    {fragment, P#ws_parser{
+                        buffer = After,
+                        frag_acc = [Payload | Acc],
+                        frag_size = NewSize}};
+                {text, false} ->
                     case validate_utf8_stream(Payload, Utf8State) of
                         {error, _} = E -> E;
                         {ok, Utf8State2} ->
@@ -245,86 +296,98 @@ handle_frame(P = #ws_parser{frag_op = FragOp, frag_acc = Acc, frag_size = FS,
                                 frag_size = NewSize,
                                 utf8_state = Utf8State2}}
                     end;
-                binary ->
+                {binary, false} ->
                     {fragment, P#ws_parser{
                         buffer = After,
                         frag_acc = [Payload | Acc],
                         frag_size = NewSize}}
             end
     end;
-handle_frame(_P, _Fin, ?WS_OP_CONT, _Payload, _After, _FS, _MaxMsg, _U) ->
+handle_frame(_P, _Fin, _Compressed, ?WS_OP_CONT, _Payload, _After,
+             _FS, _MaxMsg, _U) ->
     %% Continuation without an open fragmented message.
     {error, protocol_error}.
 
 reset_fragment(P) ->
-    P#ws_parser{frag_op = undefined, frag_acc = [], frag_size = 0, utf8_state = 0}.
+    P#ws_parser{frag_op = undefined, frag_acc = [], frag_size = 0,
+                frag_compressed = false, utf8_state = 0}.
 
 %% ---------------------------------------------------------------------
 %% Header decode. Returns `more`, `{error, protocol_error}`, or
-%% `{ok, Fin, Opcode, Len, Mask|undefined, Rest}`.
+%% `{ok, Fin, Rsv1, Opcode, Len, Mask|undefined, Rest}`. `Compress'
+%% (permessage-deflate negotiated) is the only case where a non-zero
+%% RSV is legal: RSV1 on the first frame of a data message.
 
-decode_header(Buf, _Role, _FragOp) when byte_size(Buf) < 2 ->
+decode_header(Buf, _Role, _FragOp, _Compress) when byte_size(Buf) < 2 ->
     more;
-decode_header(<<_Fin:1, Rsv:3, _:4, _/bits>>, _Role, _FragOp) when Rsv =/= 0 ->
+decode_header(<<_Fin:1, Rsv:3, _:4, _/bits>>, _Role, _FragOp, false)
+        when Rsv =/= 0 ->
     {error, protocol_error};
-decode_header(<<_:4, Opcode:4, _/bits>>, _Role, _FragOp) when Opcode > 2,
-                                                              Opcode < 8 ->
+decode_header(<<_Fin:1, Rsv:3, _:4, _/bits>>, _Role, _FragOp, true)
+        when Rsv =/= 0, Rsv =/= 2#100 ->
     {error, protocol_error};
-decode_header(<<_:4, Opcode:4, _/bits>>, _Role, _FragOp) when Opcode > 10 ->
+decode_header(<<_Fin:1, 2#100:3, Opcode:4, _/bits>>, _Role, _FragOp, true)
+        when Opcode =/= ?WS_OP_TEXT, Opcode =/= ?WS_OP_BINARY ->
+    %% RSV1 is per message: never on control or continuation frames.
     {error, protocol_error};
-decode_header(<<0:1, _:3, Opcode:4, _/bits>>, _Role, _FragOp) when Opcode >= 8 ->
+decode_header(<<_:4, Opcode:4, _/bits>>, _Role, _FragOp, _C) when Opcode > 2,
+                                                                  Opcode < 8 ->
+    {error, protocol_error};
+decode_header(<<_:4, Opcode:4, _/bits>>, _Role, _FragOp, _C) when Opcode > 10 ->
+    {error, protocol_error};
+decode_header(<<0:1, _:3, Opcode:4, _/bits>>, _Role, _FragOp, _C) when Opcode >= 8 ->
     %% Control frames must have fin=1.
     {error, protocol_error};
-decode_header(<<_:4, ?WS_OP_CONT:4, _/bits>>, _Role, undefined) ->
+decode_header(<<_:4, ?WS_OP_CONT:4, _/bits>>, _Role, undefined, _C) ->
     %% Continuation with no open fragmented message.
     {error, protocol_error};
-decode_header(<<_:4, Opcode:4, _/bits>>, _Role, FragOp) when FragOp =/= undefined,
-                                                             Opcode =/= ?WS_OP_CONT,
-                                                             Opcode < 8 ->
+decode_header(<<_:4, Opcode:4, _/bits>>, _Role, FragOp, _C) when FragOp =/= undefined,
+                                                                 Opcode =/= ?WS_OP_CONT,
+                                                                 Opcode < 8 ->
     %% Expected continuation but got a new data frame.
     {error, protocol_error};
 %% Close frame with length == 1 is illegal (must be 0 or >= 2).
-decode_header(<<_:4, ?WS_OP_CLOSE:4, _:1, 1:7, _/bits>>, _Role, _FragOp) ->
+decode_header(<<_:4, ?WS_OP_CLOSE:4, _:1, 1:7, _/bits>>, _Role, _FragOp, _C) ->
     {error, protocol_error};
 %% Mask bit must match sender role:
 %%  - When we are the server, inbound frames MUST be masked.
 %%  - When we are the client, inbound frames MUST NOT be masked.
-decode_header(<<_:8, 0:1, _/bits>>, server, _FragOp) ->
+decode_header(<<_:8, 0:1, _/bits>>, server, _FragOp, _C) ->
     {error, protocol_error};
-decode_header(<<_:8, 1:1, _/bits>>, client, _FragOp) ->
+decode_header(<<_:8, 1:1, _/bits>>, client, _FragOp, _C) ->
     {error, protocol_error};
-%% 7-bit length, no mask.
-decode_header(<<Fin:1, 0:3, Op:4, 0:1, Len:7, Rest/bits>>, _Role, _FragOp) when Len < 126 ->
-    {ok, Fin, Op, Len, undefined, Rest};
-decode_header(<<Fin:1, 0:3, Op:4, 1:1, Len:7, Mask:32, Rest/bits>>, _Role, _FragOp) when Len < 126 ->
-    {ok, Fin, Op, Len, Mask, Rest};
+%% 7-bit length, no mask. RSV is 0 or RSV1-only by the guards above.
+decode_header(<<Fin:1, Rsv1:1, _:2, Op:4, 0:1, Len:7, Rest/bits>>, _Role, _FragOp, _C) when Len < 126 ->
+    {ok, Fin, Rsv1, Op, Len, undefined, Rest};
+decode_header(<<Fin:1, Rsv1:1, _:2, Op:4, 1:1, Len:7, Mask:32, Rest/bits>>, _Role, _FragOp, _C) when Len < 126 ->
+    {ok, Fin, Rsv1, Op, Len, Mask, Rest};
 %% 16-bit length. Must be > 125. Control frames cannot use it.
-decode_header(<<Fin:1, 0:3, Op:4, 0:1, 126:7, Len:16, Rest/bits>>, _Role, _FragOp)
+decode_header(<<Fin:1, Rsv1:1, _:2, Op:4, 0:1, 126:7, Len:16, Rest/bits>>, _Role, _FragOp, _C)
   when Len > 125, Op < 8 ->
-    {ok, Fin, Op, Len, undefined, Rest};
-decode_header(<<Fin:1, 0:3, Op:4, 1:1, 126:7, Len:16, Mask:32, Rest/bits>>, _Role, _FragOp)
+    {ok, Fin, Rsv1, Op, Len, undefined, Rest};
+decode_header(<<Fin:1, Rsv1:1, _:2, Op:4, 1:1, 126:7, Len:16, Mask:32, Rest/bits>>, _Role, _FragOp, _C)
   when Len > 125, Op < 8 ->
-    {ok, Fin, Op, Len, Mask, Rest};
+    {ok, Fin, Rsv1, Op, Len, Mask, Rest};
 %% 63-bit length. Top bit must be zero.
-decode_header(<<Fin:1, 0:3, Op:4, 0:1, 127:7, 0:1, Len:63, Rest/bits>>, _Role, _FragOp)
+decode_header(<<Fin:1, Rsv1:1, _:2, Op:4, 0:1, 127:7, 0:1, Len:63, Rest/bits>>, _Role, _FragOp, _C)
   when Len > 16#ffff, Op < 8 ->
-    {ok, Fin, Op, Len, undefined, Rest};
-decode_header(<<Fin:1, 0:3, Op:4, 1:1, 127:7, 0:1, Len:63, Mask:32, Rest/bits>>, _Role, _FragOp)
+    {ok, Fin, Rsv1, Op, Len, undefined, Rest};
+decode_header(<<Fin:1, Rsv1:1, _:2, Op:4, 1:1, 127:7, 0:1, Len:63, Mask:32, Rest/bits>>, _Role, _FragOp, _C)
   when Len > 16#ffff, Op < 8 ->
-    {ok, Fin, Op, Len, Mask, Rest};
+    {ok, Fin, Rsv1, Op, Len, Mask, Rest};
 %% MSB of 63-bit length set.
-decode_header(<<_:9, 127:7, 1:1, _/bits>>, _Role, _FragOp) ->
+decode_header(<<_:9, 127:7, 1:1, _/bits>>, _Role, _FragOp, _C) ->
     {error, protocol_error};
 %% Non-minimal length encoding.
-decode_header(<<_:8, 0:1, 126:7, _:16, _/bits>>, _Role, _FragOp) ->
+decode_header(<<_:8, 0:1, 126:7, _:16, _/bits>>, _Role, _FragOp, _C) ->
     {error, protocol_error};
-decode_header(<<_:8, 1:1, 126:7, _:48, _/bits>>, _Role, _FragOp) ->
+decode_header(<<_:8, 1:1, 126:7, _:48, _/bits>>, _Role, _FragOp, _C) ->
     {error, protocol_error};
-decode_header(<<_:8, 0:1, 127:7, _:64, _/bits>>, _Role, _FragOp) ->
+decode_header(<<_:8, 0:1, 127:7, _:64, _/bits>>, _Role, _FragOp, _C) ->
     {error, protocol_error};
-decode_header(<<_:8, 1:1, 127:7, _:96, _/bits>>, _Role, _FragOp) ->
+decode_header(<<_:8, 1:1, 127:7, _:96, _/bits>>, _Role, _FragOp, _C) ->
     {error, protocol_error};
-decode_header(_, _, _) ->
+decode_header(_, _, _, _) ->
     more.
 
 %% ---------------------------------------------------------------------
@@ -399,14 +462,27 @@ encode({text, Payload}, Role) ->
 encode({binary, Payload}, Role) ->
     encode_masked_or_plain(Role, ?WS_OP_BINARY, iolist_to_binary(Payload)).
 
-encode_masked_or_plain(server, Opcode, Bin) ->
+%% @doc Encode a data frame whose payload is already deflated
+%% (permessage-deflate): same as encode/2 with RSV1 set. Only text and
+%% binary frames may be compressed (RFC 7692 §6).
+-spec encode_compressed({text, iodata()} | {binary, iodata()}, role()) ->
+    iodata().
+encode_compressed({text, Payload}, Role) ->
+    encode_frame(Role, ?WS_OP_TEXT, 1, iolist_to_binary(Payload));
+encode_compressed({binary, Payload}, Role) ->
+    encode_frame(Role, ?WS_OP_BINARY, 1, iolist_to_binary(Payload)).
+
+encode_masked_or_plain(Role, Opcode, Bin) ->
+    encode_frame(Role, Opcode, 0, Bin).
+
+encode_frame(server, Opcode, Rsv1, Bin) ->
     Len = payload_length_bits(byte_size(Bin)),
-    [<<1:1, 0:3, Opcode:4, 0:1, Len/bits>>, Bin];
-encode_masked_or_plain(client, Opcode, Bin) ->
+    [<<1:1, Rsv1:1, 0:2, Opcode:4, 0:1, Len/bits>>, Bin];
+encode_frame(client, Opcode, Rsv1, Bin) ->
     MaskKey = rand_mask_key(),
     MaskBin = <<MaskKey:32>>,
     Len = payload_length_bits(byte_size(Bin)),
-    [<<1:1, 0:3, Opcode:4, 1:1, Len/bits>>, MaskBin, mask(Bin, MaskKey)].
+    [<<1:1, Rsv1:1, 0:2, Opcode:4, 1:1, Len/bits>>, MaskBin, mask(Bin, MaskKey)].
 
 rand_mask_key() ->
     <<Key:32>> = crypto:strong_rand_bytes(4),
@@ -451,6 +527,12 @@ trim_incomplete_utf8(Bin) ->
 %% whole-payload validation. validate_utf8_stream/2 returns the state
 %% wrapped so streaming callers can tell "partial but not broken" from
 %% "invalid".
+
+%% @doc Whole-payload UTF-8 check, for consumers validating text after
+%% inflating a permessage-deflate message.
+-spec valid_utf8(binary()) -> boolean().
+valid_utf8(Bin) ->
+    validate_utf8(Bin, 0) =:= 0.
 
 validate_utf8(Bin, State) ->
     v_text(Bin, State).

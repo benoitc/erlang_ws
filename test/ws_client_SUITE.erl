@@ -18,7 +18,10 @@
          client_close_roundtrip/1,
          connect_bad_port_is_error/1,
          connect_ipv6_loopback/1,
-         close_timeout_finishes_session/1]).
+         close_timeout_finishes_session/1,
+         remote_close_reaches_terminate/1,
+         deflate_echo_roundtrip/1,
+         deflate_inflate_bound_closes_1009/1]).
 
 all() ->
     [client_handshake_and_echo,
@@ -26,7 +29,10 @@ all() ->
      client_close_roundtrip,
      connect_bad_port_is_error,
      connect_ipv6_loopback,
-     close_timeout_finishes_session].
+     close_timeout_finishes_session,
+     remote_close_reaches_terminate,
+     deflate_echo_roundtrip,
+     deflate_inflate_bound_closes_1009].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(ws),
@@ -113,8 +119,125 @@ close_timeout_finishes_session(_Config) ->
         Listener ! stop
     end.
 
+%% The peer's close code and reason surface in the handler's
+%% terminate/2 as {remote, Code, Reason}, on both sides: the client
+%% initiates the close, the server handler observes it.
+remote_close_reaches_terminate(Config) ->
+    Pid = connect_client(Config),
+    %% Drain the server handler's init notification.
+    receive {ws_test, {init, _}} -> ok after 2000 -> error(no_server_init) end,
+    ws:close(Pid, 4001, <<"bye">>),
+    receive
+        {ws_test, {terminate, Reason}} ->
+            ?assertEqual({remote, 4001, <<"bye">>}, Reason)
+    after 2000 ->
+        error(no_server_terminate)
+    end,
+    ok = wait_for_session_exit(Pid, 2000).
+
+%% Full permessage-deflate round-trip: client offers, server negotiates,
+%% text and binary echo back intact through compress/inflate on both
+%% sides (context takeover on).
+deflate_echo_roundtrip(_Config) ->
+    {Listener, Port} = start_deflate_listener(self(), #{}),
+    try
+        Pid = connect_deflate_client(Port),
+        Text = binary:copy(<<"compressible payload ">>, 500),
+        ws_session:send(Pid, {text, Text}),
+        {text, Text} = wait_for_frame(2000),
+        Bin = binary:copy(<<0, 1, 2, 3>>, 4096),
+        ws_session:send(Pid, {binary, Bin}),
+        {binary, Bin} = wait_for_frame(2000),
+        %% Second text message exercises context takeover.
+        ws_session:send(Pid, {text, Text}),
+        {text, Text} = wait_for_frame(2000),
+        ok = ws_session:stop(Pid)
+    after
+        try exit(Listener, shutdown) catch _:_ -> ok end
+    end.
+
+%% The parser's max_message bound applies to the INFLATED size, so a
+%% deflate bomb is refused with 1009 (message too big).
+deflate_inflate_bound_closes_1009(_Config) ->
+    {Listener, Port} = start_deflate_listener(self(),
+                                              #{max_message => 1024}),
+    try
+        Pid = connect_deflate_client(Port),
+        %% 1 MiB of zeros compresses to almost nothing but inflates far
+        %% past the server's 1 KiB bound.
+        ws_session:send(Pid, {binary, binary:copy(<<0>>, 1024 * 1024)}),
+        receive
+            {ws_client_terminate, Reason} ->
+                ?assertMatch({remote, 1009, _}, Reason)
+        after 2000 ->
+            error(no_client_terminate)
+        end
+    after
+        try exit(Listener, shutdown) catch _:_ -> ok end
+    end.
+
 %% ---------------------------------------------------------------------
 %% Helpers
+
+connect_deflate_client(Port) ->
+    TestPid = self(),
+    Url = iolist_to_binary(["ws://127.0.0.1:", integer_to_list(Port), "/"]),
+    {ok, Pid} = ws_client:connect(Url,
+        #{handler      => client_forwarder_handler,
+          handler_opts => #{notify => TestPid},
+          compress     => true}),
+    Pid.
+
+%% Echo listener that negotiates permessage-deflate. `ParserOpts' are
+%% forwarded to the server session (e.g. a small max_message).
+start_deflate_listener(TestPid, ParserOpts) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        {ok, Listen} = gen_tcp:listen(0,
+            [binary, {active, false}, {reuseaddr, true}, {packet, 0}]),
+        {ok, P} = inet:port(Listen),
+        Parent ! {ready, P},
+        deflate_listener_loop(Listen, TestPid, ParserOpts)
+    end),
+    Port = receive {ready, P} -> P after 2000 -> error(listener_not_ready) end,
+    {Pid, Port}.
+
+deflate_listener_loop(Listen, TestPid, ParserOpts) ->
+    case gen_tcp:accept(Listen, 500) of
+        {ok, Sock} ->
+            Handler = spawn(fun() ->
+                receive {handle, S} -> serve_deflate(S, TestPid, ParserOpts) end
+            end),
+            ok = gen_tcp:controlling_process(Sock, Handler),
+            Handler ! {handle, Sock},
+            deflate_listener_loop(Listen, TestPid, ParserOpts);
+        {error, timeout} ->
+            deflate_listener_loop(Listen, TestPid, ParserOpts);
+        {error, closed} ->
+            ok
+    end.
+
+serve_deflate(Sock, TestPid, ParserOpts) ->
+    {ok, _Method, _Path, Hdrs, Rest} = read_request(Sock, <<>>, 2000),
+    {ok, Info} = ws_h1_upgrade:validate_request(Hdrs),
+    Offered = maps:get(extensions, Info, []),
+    {RespExtra, AcceptOpts} =
+        case ws_deflate:negotiate(Offered, #{}) of
+            {ok, RespExt, Negotiated} ->
+                {#{extensions => [iolist_to_binary(RespExt)]},
+                 #{deflate => Negotiated, parser_opts => ParserOpts}};
+            ignore ->
+                {#{}, #{parser_opts => ParserOpts}}
+        end,
+    RespHdrs = ws_h1_upgrade:response_headers(Info, RespExtra),
+    ok = gen_tcp:send(Sock, format_response(101, RespHdrs)),
+    HandlerOpts = #{mode => echo, notify => TestPid},
+    {ok, Pid} = ws:accept(ws_transport_gen_tcp, Sock, #{},
+                          ws_test_handler, HandlerOpts, AcceptOpts),
+    case Rest of
+        <<>> -> ok;
+        _ -> Pid ! {tcp, Sock, Rest}
+    end.
 
 connect_client(Config) ->
     Port = ?config(port, Config),

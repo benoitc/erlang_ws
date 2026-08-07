@@ -46,7 +46,13 @@
     frag_op   = undefined :: text | binary | undefined,
     frag_acc  = []      :: [binary()],
     frag_size = 0       :: non_neg_integer(),
+    %% RSV1 was set on the first frame of the in-progress fragmented
+    %% message (permessage-deflate).
+    frag_compressed = false :: boolean(),
     utf8_state = 0      :: non_neg_integer(), %% UTF-8 DFA state (text frames)
     max_frame   = ?WS_DEFAULT_MAX_FRAME_SIZE   :: pos_integer(),
-    max_message = ?WS_DEFAULT_MAX_MESSAGE_SIZE :: pos_integer()
+    max_message = ?WS_DEFAULT_MAX_MESSAGE_SIZE :: pos_integer(),
+    %% permessage-deflate negotiated: accept RSV1 on data frames and
+    %% deliver those messages as {compressed, text | binary, Payload}.
+    compress = false :: boolean()
 }).

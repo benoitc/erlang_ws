@@ -15,5 +15,8 @@ handle_in(Msg, State = #{notify := Pid}) ->
 handle_info(_Msg, State) ->
     {ok, State}.
 
+terminate(Reason, #{notify := Pid}) when is_pid(Pid) ->
+    Pid ! {ws_client_terminate, Reason},
+    ok;
 terminate(_Reason, _State) ->
     ok.

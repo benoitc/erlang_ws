@@ -4,6 +4,36 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-08-07
+
+### Added
+
+- permessage-deflate (RFC 7692) is now wired end to end. The frame parser
+  accepts RSV1 on the first frame of a data message when the `compress`
+  parser option is on and delivers such messages as
+  `{compressed, text | binary, Payload}`; `ws_frame:encode_compressed/2`
+  emits RSV1 frames. The session takes a `deflate` option (the negotiated
+  parameters), inflates inbound messages bounded by `max_message` (a
+  deflate bomb closes with 1009), validates text UTF-8 after inflating,
+  and compresses outbound data frames with per-direction context
+  takeover. `ws_deflate:negotiate/2` and `ws_deflate:parse_offer/1`
+  negotiate straight from the raw `Sec-WebSocket-Extensions` elements the
+  upgrade validators deliver.
+- `ws_client:connect/2` accepts `compress => true` to offer
+  permessage-deflate and run the session compressed when the server
+  agrees.
+- `ws_frame:valid_utf8/1`: whole-payload UTF-8 check for consumers
+  validating inflated text.
+
+### Changed
+
+- The peer's close frame now reaches the handler: `terminate/2` receives
+  `{remote, Code, Reason}` when the peer's close carried a status code,
+  and `remote` for a bare close. Other shutdown reasons are passed
+  through unchanged.
+
+[0.4.0]: https://github.com/benoitc/erlang_ws/releases/tag/0.4.0
+
 ## [0.3.0] - 2026-05-29
 
 ### Changed

@@ -77,3 +77,38 @@ roundtrip_test_() ->
           zlib:close(D), zlib:close(I)
       end}
      || Size <- [0, 1, 16, 1024, 64000]].
+
+%% ---------------------------------------------------------------------
+%% Offer parsing + one-call negotiation.
+
+parse_offer_plain_test() ->
+    ?assertEqual({ok, []}, ws_deflate:parse_offer(<<"permessage-deflate">>)).
+
+parse_offer_params_test() ->
+    ?assertEqual(
+        {ok, [<<"client_max_window_bits">>,
+              {<<"server_max_window_bits">>, <<"10">>}]},
+        ws_deflate:parse_offer(
+            <<"permessage-deflate; client_max_window_bits; "
+              "server_max_window_bits=10">>)).
+
+parse_offer_quoted_value_test() ->
+    ?assertEqual(
+        {ok, [{<<"server_max_window_bits">>, <<"12">>}]},
+        ws_deflate:parse_offer(
+            <<"permessage-deflate; server_max_window_bits=\"12\"">>)).
+
+parse_offer_other_extension_test() ->
+    ?assertEqual(not_deflate, ws_deflate:parse_offer(<<"bbf-usp-protocol">>)).
+
+negotiate_picks_first_acceptable_test() ->
+    Exts = [<<"some-other-ext">>,
+            <<"permessage-deflate; client_max_window_bits">>],
+    {ok, Resp, Negotiated} = ws_deflate:negotiate(Exts, #{}),
+    ?assertMatch(#{server_context_takeover := takeover}, Negotiated),
+    ?assertMatch({_, _}, binary:match(iolist_to_binary(Resp),
+                                      <<"permessage-deflate">>)).
+
+negotiate_nothing_offered_test() ->
+    ?assertEqual(ignore, ws_deflate:negotiate([<<"other">>], #{})),
+    ?assertEqual(ignore, ws_deflate:negotiate([], #{})).

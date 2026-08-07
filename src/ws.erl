@@ -29,6 +29,9 @@
 
 -type accept_opts() :: #{
     parser_opts   => map(),
+    %% Negotiated permessage-deflate parameters (see
+    %% ws_deflate:negotiate/2); enables compression on the session.
+    deflate       => ws_deflate:negotiated(),
     idle_timeout  => timeout(),
     close_timeout => timeout()
 }.

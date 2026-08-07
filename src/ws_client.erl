@@ -32,6 +32,9 @@
     handler_opts       => term(),
     subprotocols       => [binary()],
     extensions         => [binary()],
+    %% Offer permessage-deflate (RFC 7692); when the server agrees the
+    %% session runs compressed in both directions.
+    compress           => boolean(),
     origin             => binary(),
     extra_headers      => [{binary(), binary()}],
     timeout            => timeout(),
@@ -150,7 +153,15 @@ merge_ssl_opts(Base, User) ->
     Filtered ++ User.
 
 upgrade(Transport, Handle, Host, Port, Path, Opts, Timeout, MaxHs) ->
-    ClientOpts = maps:with([subprotocols, extensions, origin, extra_headers], Opts),
+    ClientOpts0 = maps:with([subprotocols, extensions, origin, extra_headers], Opts),
+    ClientOpts = case maps:get(compress, Opts, false) of
+        true ->
+            Offer = iolist_to_binary(ws_deflate:client_offer(#{})),
+            Exts = maps:get(extensions, ClientOpts0, []),
+            ClientOpts0#{extensions => Exts ++ [Offer]};
+        false ->
+            ClientOpts0
+    end,
     {Key, Hdrs} = ws_h1_upgrade:build_request(Host, Port, Path, ClientOpts),
     Request = format_request(Path, Hdrs),
     case Transport:send(Handle, Request) of
@@ -184,11 +195,20 @@ verify_accept(Key, Info, Transport, Handle, Opts) ->
     end.
 
 start_session(Transport, Handle, Info, Opts) ->
+    case deflate_from_response(Info, Opts) of
+        {error, _} = DErr ->
+            _ = Transport:close(Handle),
+            DErr;
+        Deflate ->
+            start_session(Transport, Handle, Info, Opts, Deflate)
+    end.
+
+start_session(Transport, Handle, Info, Opts, Deflate) ->
     HandlerMod = maps:get(handler, Opts),
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
     ParserOpts = maps:get(parser_opts, Opts, #{}),
     Req = #{response => Info},
-    StartOpts = maps:merge(
+    StartOpts0 = maps:merge(
         maps:with([idle_timeout, close_timeout], Opts),
         #{
             transport    => Transport,
@@ -199,6 +219,10 @@ start_session(Transport, Handle, Info, Opts) ->
             req          => Req,
             parser_opts  => ParserOpts
         }),
+    StartOpts = case Deflate of
+        undefined -> StartOpts0;
+        {ok, Negotiated} -> StartOpts0#{deflate => Negotiated}
+    end,
     case ws_session:start_link(StartOpts) of
         {ok, Pid} ->
             case Transport:controlling_process(Handle, Pid) of
@@ -210,6 +234,28 @@ start_session(Transport, Handle, Info, Opts) ->
                     Err
             end;
         Err -> Err
+    end.
+
+%% When permessage-deflate was offered, look for the server's
+%% acceptance in the 101 response extensions. A malformed acceptance is
+%% an error; an absent one simply runs the session uncompressed.
+deflate_from_response(Info, Opts) ->
+    case maps:get(compress, Opts, false) of
+        false -> undefined;
+        true -> find_deflate_response(maps:get(extensions, Info, []))
+    end.
+
+find_deflate_response([]) ->
+    undefined;
+find_deflate_response([Ext | Rest]) ->
+    case ws_deflate:parse_offer(Ext) of
+        {ok, Params} ->
+            case ws_deflate:parse_server_response(Params) of
+                {ok, _} = Ok -> Ok;
+                {error, _} = E -> E
+            end;
+        not_deflate ->
+            find_deflate_response(Rest)
     end.
 
 %% ---------------------------------------------------------------------
