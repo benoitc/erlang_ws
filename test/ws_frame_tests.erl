@@ -310,3 +310,52 @@ encode_close_truncates_on_utf8_boundary_test() ->
     {ok, [{close, 1000, Got}], _} = ws_frame:parse(client_parser(), Bin),
     ?assert(byte_size(Got) =< 123),
     ?assertEqual(Got, unicode:characters_to_binary(Got)).
+
+%% ---------------------------------------------------------------------
+%% permessage-deflate framing (RSV1).
+
+rsv1_rejected_without_compress_test() ->
+    Bin = iolist_to_binary(ws_frame:encode_compressed({text, <<1, 2, 3>>}, client)),
+    ?assertMatch({error, protocol_error, _},
+                 ws_frame:parse(server_parser(), Bin)).
+
+rsv1_rejected_on_control_frame_test() ->
+    %% ping with RSV1 set, masked; illegal even with compress on.
+    Frame = <<1:1, 1:1, 0:2, 16#9:4, 1:1, 0:7, 0:32>>,
+    P = ws_frame:init_parser(#{role => server, compress => true}),
+    ?assertMatch({error, protocol_error, _}, ws_frame:parse(P, Frame)).
+
+rsv2_rejected_with_compress_test() ->
+    Frame = <<1:1, 0:1, 1:1, 0:1, 16#1:4, 1:1, 1:7, 0:32, $a>>,
+    P = ws_frame:init_parser(#{role => server, compress => true}),
+    ?assertMatch({error, protocol_error, _}, ws_frame:parse(P, Frame)).
+
+compressed_message_passthrough_test() ->
+    %% With compress on, an RSV1 data frame is delivered raw and tagged;
+    %% the payload is NOT UTF-8 validated (it is a deflate stream).
+    Payload = <<16#ff, 16#fe, 16#00>>,
+    Bin = iolist_to_binary(ws_frame:encode_compressed({text, Payload}, client)),
+    P = ws_frame:init_parser(#{role => server, compress => true}),
+    {ok, Msgs, _} = ws_frame:parse(P, Bin),
+    ?assertEqual([{compressed, text, Payload}], Msgs).
+
+compressed_fragmented_message_test() ->
+    %% RSV1 on the first fragment only; continuations carry RSV1=0. The
+    %% reassembled message keeps the compressed tag.
+    F1 = <<0:1, 1:1, 0:2, 16#2:4, 1:1, 2:7, 0:32, 1, 2>>,
+    F2 = <<1:1, 0:3, 16#0:4, 1:1, 2:7, 0:32, 3, 4>>,
+    P = ws_frame:init_parser(#{role => server, compress => true}),
+    {ok, [], P1} = ws_frame:parse(P, F1),
+    {ok, Msgs, _} = ws_frame:parse(P1, F2),
+    ?assertEqual([{compressed, binary, <<1, 2, 3, 4>>}], Msgs).
+
+rsv1_rejected_on_continuation_test() ->
+    F1 = <<0:1, 1:1, 0:2, 16#2:4, 1:1, 2:7, 0:32, 1, 2>>,
+    F2 = <<1:1, 1:1, 0:2, 16#0:4, 1:1, 2:7, 0:32, 3, 4>>,
+    P = ws_frame:init_parser(#{role => server, compress => true}),
+    {ok, [], P1} = ws_frame:parse(P, F1),
+    ?assertMatch({error, protocol_error, _}, ws_frame:parse(P1, F2)).
+
+valid_utf8_helper_test() ->
+    ?assert(ws_frame:valid_utf8(<<"héllo"/utf8>>)),
+    ?assertNot(ws_frame:valid_utf8(<<16#C2, $A>>)).

@@ -51,6 +51,19 @@
     handler_state :: term(),
     close_sent = false :: boolean(),
     close_received = false :: boolean(),
+    %% Close info received from the peer, reported to the handler's
+    %% terminate/2 as {remote, Code, Reason} (or `remote' for a bare
+    %% close frame with no status code).
+    peer_close = undefined :: undefined | remote | {ws_close:code(), binary()},
+    %% permessage-deflate state once negotiated (RFC 7692): zlib
+    %% streams plus per-direction context-takeover policy.
+    deflate = undefined ::
+        undefined
+        | #{inflate := zlib:zstream(),
+            deflate := zlib:zstream(),
+            inflate_takeover := takeover | no_takeover,
+            deflate_takeover := takeover | no_takeover,
+            max_inflate := pos_integer() | infinity},
     idle_timeout = ?WS_DEFAULT_IDLE_TIMEOUT   :: timeout(),
     close_timeout = ?WS_DEFAULT_CLOSE_TIMEOUT :: timeout()
 }).
@@ -63,6 +76,10 @@
     handler_opts => term(),
     req       => map(),
     parser_opts => map(),
+    %% Negotiated permessage-deflate parameters (from
+    %% ws_deflate:negotiate/2 or ws_deflate:parse_server_response/1).
+    %% Enables compression on both directions of the session.
+    deflate => ws_deflate:negotiated(),
     idle_timeout => timeout(),
     close_timeout => timeout()
 }.
@@ -108,11 +125,20 @@ callback_mode() -> state_functions.
 init(#{transport := TM, handle := H, role := Role,
        handler := HMod} = Opts) ->
     ParserOpts = maps:get(parser_opts, Opts, #{}),
-    Parser = ws_frame:init_parser(ParserOpts#{role => Role}),
+    Deflate = case maps:get(deflate, Opts, undefined) of
+        undefined -> undefined;
+        Negotiated -> init_deflate_state(Negotiated, Role, ParserOpts)
+    end,
+    ParserOpts1 = case Deflate of
+        undefined -> ParserOpts;
+        _ -> ParserOpts#{compress => true}
+    end,
+    Parser = ws_frame:init_parser(ParserOpts1#{role => Role}),
     HOpts = maps:get(handler_opts, Opts, #{}),
     Req = maps:get(req, Opts, #{}),
     St0 = #st{transport_mod = TM, handle = H, role = Role,
               parser = Parser, handler_mod = HMod,
+              deflate = Deflate,
               idle_timeout = maps:get(idle_timeout, Opts,
                                       ?WS_DEFAULT_IDLE_TIMEOUT),
               close_timeout = maps:get(close_timeout, Opts,
@@ -240,14 +266,40 @@ dispatch_messages([Msg | Rest], St, State) ->
     case handle_message(Msg, St, State) of
         {continue, St2, State2} ->
             dispatch_messages(Rest, St2, State2);
+        {abort, Code, Why, St2} ->
+            abort_with_close(Code, Why, St2);
         {stop, Reason, St2} ->
             {stop, Reason, St2}
     end.
 
 handle_message(close, St, _State) ->
-    handle_close_received(?WS_CLOSE_NORMAL, <<>>, St);
+    handle_close_received(?WS_CLOSE_NORMAL, <<>>,
+                          St#st{peer_close = remote});
 handle_message({close, Code, Reason}, St, _State) ->
-    handle_close_received(Code, Reason, St);
+    handle_close_received(Code, Reason,
+                          St#st{peer_close = {Code, Reason}});
+handle_message({compressed, Kind, Payload},
+               St = #st{deflate = #{inflate := Z,
+                                    inflate_takeover := Takeover,
+                                    max_inflate := Max}}, State) ->
+    Inflated = try
+        ws_deflate:inflate(Z, Takeover, Payload, Max)
+    catch
+        _:_ -> {error, bad_deflate}
+    end,
+    case {Inflated, Kind} of
+        {{ok, Data}, text} ->
+            case ws_frame:valid_utf8(Data) of
+                true -> invoke_handler({text, Data}, St, State);
+                false -> {abort, ?WS_CLOSE_INVALID_UTF8, invalid_utf8, St}
+            end;
+        {{ok, Data}, binary} ->
+            invoke_handler({binary, Data}, St, State);
+        {{error, {inflate_too_big, _}}, _} ->
+            {abort, ?WS_CLOSE_TOO_BIG, message_too_big, St};
+        {{error, _}, _} ->
+            {abort, ?WS_CLOSE_PROTOCOL_ERROR, bad_deflate, St}
+    end;
 handle_message({ping, Payload}, St = #st{}, State) ->
     case send_frames([{pong, Payload}], St) of
         {ok, St2} ->
@@ -351,16 +403,54 @@ frames(L) when is_list(L) -> L;
 frames(F) -> [F].
 
 send_frames([], St) -> {ok, St};
-send_frames([F | Rest], St = #st{transport_mod = TM, handle = H, role = Role}) ->
-    Iolist = ws_frame:encode(F, Role),
+send_frames([F | Rest], St = #st{transport_mod = TM, handle = H, role = Role,
+                                 deflate = Deflate}) ->
+    Iolist = encode_out(F, Role, Deflate),
     case TM:send(H, Iolist) of
         ok -> send_frames(Rest, St);
         {error, _} = E -> E
     end.
 
-terminate(_Reason, _StateName, #st{handler_mod = HMod, handler_state = HS}) ->
+%% With permessage-deflate negotiated, data frames go out compressed
+%% (RSV1 set); control frames are never compressed (RFC 7692 §6).
+encode_out({Kind, Payload}, Role, #{deflate := Z, deflate_takeover := Takeover})
+        when Kind =:= text; Kind =:= binary ->
+    Compressed = ws_deflate:deflate(Z, Takeover, Payload),
+    ws_frame:encode_compressed({Kind, Compressed}, Role);
+encode_out(F, Role, _Deflate) ->
+    ws_frame:encode(F, Role).
+
+%% Which context-takeover policy applies to each direction depends on
+%% the role: the `client_*' parameters govern client-to-server frames,
+%% the `server_*' parameters the reverse.
+init_deflate_state(Negotiated, Role, ParserOpts) ->
+    {InTakeover, OutTakeover} = case Role of
+        server -> {maps:get(client_context_takeover, Negotiated),
+                   maps:get(server_context_takeover, Negotiated)};
+        client -> {maps:get(server_context_takeover, Negotiated),
+                   maps:get(client_context_takeover, Negotiated)}
+    end,
+    #{inflate => ws_deflate:init_inflate(Negotiated, Role),
+      deflate => ws_deflate:init_deflate(Negotiated, Role),
+      inflate_takeover => InTakeover,
+      deflate_takeover => OutTakeover,
+      %% Inflated size is bounded by the same limit the parser applies
+      %% to uncompressed messages, so a deflate bomb cannot bypass it.
+      max_inflate => maps:get(max_message, ParserOpts,
+                              ?WS_DEFAULT_MAX_MESSAGE_SIZE)}.
+
+terminate(Reason, _StateName, #st{handler_mod = HMod, handler_state = HS,
+                                  peer_close = PeerClose}) ->
+    %% Surface the peer's close frame to the handler: {remote, Code,
+    %% Reason} when it carried a status code, `remote' for a bare
+    %% close. Other shutdowns pass the raw reason through.
+    HReason = case PeerClose of
+        undefined -> Reason;
+        remote -> remote;
+        {Code, Bin} -> {remote, Code, Bin}
+    end,
     _ = case erlang:function_exported(HMod, terminate, 2) of
-        true -> HMod:terminate(_Reason, HS);
+        true -> HMod:terminate(HReason, HS);
         false -> ok
     end,
     ok.

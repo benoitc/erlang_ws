@@ -27,6 +27,8 @@
 -module(ws_deflate).
 
 -export([negotiate_server/2]).
+-export([negotiate/2]).
+-export([parse_offer/1]).
 -export([client_offer/1]).
 -export([parse_server_response/1]).
 -export([init_inflate/2, init_deflate/2]).
@@ -63,6 +65,50 @@
 %% client's `Sec-WebSocket-Extensions' and server policy in Opts.
 %% Returns either `ignore' (cannot agree) or
 %% `{ok, ResponseHeader :: iolist(), negotiated()}`.
+
+%% @doc Negotiate against the peer's raw `Sec-WebSocket-Extensions'
+%% offers as the upgrade validators deliver them (one binary per
+%% comma-separated element, e.g. `<<"permessage-deflate;
+%% client_max_window_bits">>'). Tries each permessage-deflate offer in
+%% order and settles on the first that can be agreed on. Returns the
+%% response header value (iolist) plus the negotiated parameters, or
+%% `ignore' when the peer offered nothing acceptable.
+-spec negotiate([binary()], opts()) -> ignore | {ok, iolist(), negotiated()}.
+negotiate(Extensions, Opts) ->
+    Offers = [Params || Ext <- Extensions, {ok, Params} <- [parse_offer(Ext)]],
+    try_offers(Offers, Opts).
+
+try_offers([], _Opts) -> ignore;
+try_offers([Params | Rest], Opts) ->
+    case negotiate_server(Params, Opts) of
+        ignore -> try_offers(Rest, Opts);
+        {ok, _, _} = Ok -> Ok
+    end.
+
+%% @doc Parse one `Sec-WebSocket-Extensions' element into `params()'
+%% when it is a permessage-deflate offer.
+-spec parse_offer(binary()) -> {ok, params()} | not_deflate.
+parse_offer(Ext) when is_binary(Ext) ->
+    [Name | Params] =
+        [string:trim(P) || P <- binary:split(Ext, <<";">>, [global])],
+    case Name of
+        <<"permessage-deflate">> -> {ok, [parse_param(P) || P <- Params]};
+        _ -> not_deflate
+    end.
+
+parse_param(P) ->
+    case binary:split(P, <<"=">>) of
+        [K] -> K;
+        [K, V] -> {K, unquote(string:trim(V))}
+    end.
+
+unquote(<<$", Rest/binary>>) when byte_size(Rest) >= 1 ->
+    case binary:last(Rest) of
+        $" -> binary:part(Rest, 0, byte_size(Rest) - 1);
+        _ -> Rest
+    end;
+unquote(V) ->
+    V.
 
 -spec negotiate_server(params(), opts()) ->
     ignore | {ok, iolist(), negotiated()}.
