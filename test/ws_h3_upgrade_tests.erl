@@ -10,11 +10,17 @@ good() ->
      {<<":protocol">>,  <<"websocket">>},
      {<<":scheme">>,    <<"https">>},
      {<<":authority">>, <<"example.com">>},
-     {<<":path">>,      <<"/chat">>}].
+     {<<":path">>,      <<"/chat">>},
+     {<<"sec-websocket-version">>, <<"13">>}].
 
 validate_request_ok_test() ->
     ?assertMatch({ok, #{protocol := <<"websocket">>}},
                  ws_h3_upgrade:validate_request(good())).
+
+validate_request_checks_version_test() ->
+    Bad = lists:keydelete(<<"sec-websocket-version">>, 1, good()),
+    ?assertMatch({error, {unsupported_version, undefined}},
+                 ws_h3_upgrade:validate_request(Bad)).
 
 response_headers_status_200_test() ->
     {ok, Info} = ws_h3_upgrade:validate_request(good()),
@@ -31,7 +37,9 @@ client_request_builds_connect_test() ->
     {ok, Hdrs} = ws_h3_upgrade:client_request(<<"https">>, <<"e">>, <<"/">>,
                     #{peer_enable_connect_protocol => true}),
     ?assertEqual(<<"CONNECT">>, proplists:get_value(<<":method">>, Hdrs)),
-    ?assertEqual(<<"websocket">>, proplists:get_value(<<":protocol">>, Hdrs)).
+    ?assertEqual(<<"websocket">>, proplists:get_value(<<":protocol">>, Hdrs)),
+    ?assertEqual(<<"13">>,
+                 proplists:get_value(<<"sec-websocket-version">>, Hdrs)).
 
 validate_response_2xx_test() ->
     ?assertMatch({ok, _}, ws_h3_upgrade:validate_response(200, [])).

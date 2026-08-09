@@ -50,6 +50,7 @@
     scheme     := binary(),
     authority  := binary(),
     path       := binary(),
+    version    := binary(),
     subprotocols := [binary()],
     extensions := [binary()],
     selected_subprotocol => binary()
@@ -81,7 +82,8 @@ validate_request(Headers, Opts) ->
         fun() -> require(<<":protocol">>, <<"websocket">>, H, wrong_protocol) end,
         fun() -> require_present(<<":scheme">>, H, missing_scheme) end,
         fun() -> require_present(<<":authority">>, H, missing_authority) end,
-        fun() -> require_present(<<":path">>, H, missing_path) end
+        fun() -> require_present(<<":path">>, H, missing_path) end,
+        fun() -> check_version(H) end
      ],
      fun() ->
         Info0 = #{
@@ -90,11 +92,22 @@ validate_request(Headers, Opts) ->
             scheme    => value(<<":scheme">>, H),
             authority => value(<<":authority">>, H),
             path      => value(<<":path">>, H),
+            version   => <<"13">>,
             subprotocols => split_list(value(<<"sec-websocket-protocol">>, H)),
             extensions   => split_list(value(<<"sec-websocket-extensions">>, H))
         },
         check_subprotocols(Info0, Opts)
      end).
+
+%% RFC 8441 section 5 drops Sec-WebSocket-Key and Sec-WebSocket-Accept,
+%% since `:protocol' supersedes them, but keeps Sec-WebSocket-Version
+%% "as defined in [RFC6455]". Same check and same error shape as
+%% `ws_h1_upgrade:check_version/1'.
+check_version(H) ->
+    case value(<<"sec-websocket-version">>, H) of
+        <<"13">> -> ok;
+        V -> {error, {unsupported_version, V}}
+    end.
 
 check_subprotocols(Info, #{required_subprotocols := Required}) ->
     Offered = maps:get(subprotocols, Info),
@@ -140,7 +153,8 @@ client_request(Scheme, Authority, Path, Opts, Extra) ->
     Subs = maps:get(subprotocols, Opts, []),
     Exts = maps:get(extensions, Opts, []),
     Origin = maps:get(origin, Opts, undefined),
-    Rest = optional_list(<<"sec-websocket-protocol">>, Subs)
+    Rest = [{<<"sec-websocket-version">>, <<"13">>}]
+        ++ optional_list(<<"sec-websocket-protocol">>, Subs)
         ++ optional_list(<<"sec-websocket-extensions">>, Exts)
         ++ optional_value(<<"origin">>, Origin)
         ++ maps:get(extra_headers, Opts, [])

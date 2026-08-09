@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `ws_h2_upgrade` (and `ws_h3_upgrade` through it) now handles
+  `Sec-WebSocket-Version` the way RFC 8441 section 5 requires:
+  `validate_request/1,2` rejects an extended CONNECT whose version is
+  absent or not `13` with `{error, {unsupported_version, V}}`, matching
+  `ws_h1_upgrade`, and surfaces `version` in `request_info()`;
+  `client_request/4,5` sends the header. Servers that were accepting
+  version-less CONNECT streams will now reject them.
+
 ## [0.4.0] - 2026-08-07
 
 ### Added
