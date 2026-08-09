@@ -71,9 +71,19 @@ A couple of gotchas learned the hard way:
   process that dies after the accept. If you want the session tied
   to *your* process, monitor `Pid` and act on `DOWN` messages.
 - Any bytes you read past the `\r\n\r\n` blank line while parsing
-  the request are the peer's first WebSocket frame — forward them
-  to the session process as `{tcp, Handle, Rest}` so the transport's
-  `classify/2` can pick them up.
+  the request are the peer's first WebSocket frame. Hand them to
+  `ws:accept/6` as `initial_data`:
+
+  ```erlang
+  ws:accept(ws_transport_gen_tcp, Sock, Req, chat_handler, #{},
+            #{initial_data => Rest}).
+  ```
+
+  The session replays them before it arms the socket, so they stay
+  ahead of anything the peer sends next. Posting them to the session
+  as a `{tcp, Handle, Rest}` message instead leaves the order to
+  chance and only works for transports whose message shape you can
+  forge.
 - Don't switch the socket to active mode before calling
   `ws:accept/5`. The session handles that after
   `controlling_process/2`.
