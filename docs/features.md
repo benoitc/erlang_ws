@@ -16,8 +16,11 @@ drives the underlying socket or stream.
 - **RFC 7692** — permessage-deflate client / server negotiation and
   inflate / deflate (opt-in via `ws_deflate`).
 - **RFC 8441** — extended CONNECT request and response validation
-  for HTTP/2 (`ws_h2_upgrade`). Embedders must configure their H2
-  stack to advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`.
+  for HTTP/2 (`ws_h2_upgrade`). `Sec-WebSocket-Key` and
+  `Sec-WebSocket-Accept` are superseded by `:protocol`;
+  `Sec-WebSocket-Version: 13` is still required and checked.
+  Embedders must configure their H2 stack to advertise
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`.
 - **RFC 9220** — extended CONNECT for HTTP/3 with
   `SETTINGS_ENABLE_CONNECT_PROTOCOL` enabled in H3 settings
   (`ws_h3_upgrade`).
