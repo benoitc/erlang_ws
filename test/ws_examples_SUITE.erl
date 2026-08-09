@@ -17,6 +17,8 @@
          chat_sender_does_not_receive_own_message/1,
          many_concurrent_echo_clients/1,
          server_receives_fragmented_text/1,
+         server_receives_frame_pipelined_with_handshake/1,
+         greeting_at_upgrade_survives_end_to_end/1,
          client_sends_pings_and_gets_pongs/1,
          server_picks_matching_subprotocol/1,
          server_rejects_no_acceptable_subprotocol/1,
@@ -31,6 +33,8 @@ all() ->
      chat_sender_does_not_receive_own_message,
      many_concurrent_echo_clients,
      server_receives_fragmented_text,
+     server_receives_frame_pipelined_with_handshake,
+     greeting_at_upgrade_survives_end_to_end,
      client_sends_pings_and_gets_pongs,
      server_picks_matching_subprotocol,
      server_rejects_no_acceptable_subprotocol,
@@ -211,6 +215,67 @@ server_receives_fragmented_text(_Config) ->
         ws_h1_tcp_server:stop(Server)
     end.
 
+%% Mirror of the client-side coalescing case: a client that pipelines
+%% its first frame with the upgrade request leaves those bytes in the
+%% embedder's read buffer, past the end of the headers. They reach the
+%% session as `initial_data', which the session drains before it arms
+%% the socket.
+%%
+%% The second frame is what makes the ordering observable. It goes out
+%% on its own write, so it is sitting in the receive buffer by the time
+%% the session activates: handing the pipelined bytes over as a fake
+%% socket message *after* activation lets this one overtake them, and
+%% the echoes come back swapped.
+server_receives_frame_pipelined_with_handshake(_Config) ->
+    {ok, Server} = ws_h1_tcp_server:start_link(
+        #{handler => echo_server, handler_opts => #{}}),
+    try
+        {ok, P} = ws_h1_tcp_server:port(Server),
+        First = ws_frame:encode({text, <<"early">>}, client),
+        {ok, Sock, Rest} = raw_ws_connect(P, "/", First),
+        ok = gen_tcp:send(Sock, ws_frame:encode({text, <<"second">>},
+                                                client)),
+        P0 = ws_frame:init_parser(#{role => client}),
+        {ok, Queued, P1} = ws_frame:parse(P0, Rest),
+        {Msg1, S1} = recv_one(Sock, 2000, {Queued, P1}),
+        {Msg2, _}  = recv_one(Sock, 2000, S1),
+        ?assertEqual({text, <<"early">>}, Msg1),
+        ?assertEqual({text, <<"second">>}, Msg2),
+        ok = gen_tcp:close(Sock)
+    after
+        ws_h1_tcp_server:stop(Server)
+    end.
+
+%% End-to-end version of the two cases above: real server, real client,
+%% no hand-rolled socket on either side. The handler greets from
+%% `init/2', so the session writes that frame immediately after the
+%% embedder's 101 and the client's first recv can pick up both.
+%%
+%% Whether it does is a timing matter, so one connection proves little
+%% and the case opens many. Each greeting must arrive whichever way the
+%% bytes were split, and the echo after it proves the parser survived
+%% the replay with its state intact.
+greeting_at_upgrade_survives_end_to_end(_Config) ->
+    {ok, Server} = ws_h1_tcp_server:start_link(
+        #{handler => greeting_server_handler,
+          handler_opts => #{greeting => <<"welcome">>}}),
+    try
+        {ok, P} = ws_h1_tcp_server:port(Server),
+        lists:foreach(fun(N) ->
+            {ok, Conn} = connect_client(P, #{}),
+            ?assertEqual({text, <<"welcome">>}, wait_msg(2000)),
+            Payload = integer_to_binary(N),
+            ws:send(Conn, {text, Payload}),
+            ?assertEqual({text, Payload}, wait_msg(2000)),
+            ok = ws:close(Conn, 1000, <<>>),
+            %% The close reply is forwarded too; drop it so the next
+            %% iteration's first message is its own greeting.
+            flush_forwards()
+        end, lists:seq(1, 50))
+    after
+        ws_h1_tcp_server:stop(Server)
+    end.
+
 client_sends_pings_and_gets_pongs(_Config) ->
     {ok, Server} = ws_h1_tcp_server:start_link(
         #{handler => echo_server, handler_opts => #{}}),
@@ -349,6 +414,14 @@ wait_msg(Timeout) ->
     after Timeout -> error(timeout)
     end.
 
+%% Drain forwarded frames left over from a finished connection (the
+%% close reply, mostly) so the next one starts on an empty mailbox.
+flush_forwards() ->
+    receive
+        {ws_forward, _} -> flush_forwards()
+    after 50 -> ok
+    end.
+
 wait_echo_msg(Timeout) ->
     receive
         {echo, _} = M -> M
@@ -365,6 +438,14 @@ flush_one(_RxMarker, Timeout) ->
     end.
 
 raw_ws_connect(Port, Path) ->
+    {ok, Sock, _Rest} = raw_ws_connect(Port, Path, <<>>),
+    {ok, Sock}.
+
+%% `Trailer' rides in the same write as the upgrade request, so the
+%% server reads it past the end of the headers. Returns the bytes that
+%% followed the 101 in the client's own recv; the caller must seed its
+%% parser with them or a fast reply can be lost.
+raw_ws_connect(Port, Path, Trailer) ->
     {ok, Sock} = gen_tcp:connect({127,0,0,1}, Port,
         [binary, {active, false}, {packet, 0}]),
     Key = ws_h1_upgrade:client_key(),
@@ -373,10 +454,10 @@ raw_ws_connect(Port, Path) ->
             "Upgrade: websocket\r\n",
             "Connection: Upgrade\r\n",
             "Sec-WebSocket-Key: ">>, Key, <<"\r\n",
-            "Sec-WebSocket-Version: 13\r\n\r\n">>],
+            "Sec-WebSocket-Version: 13\r\n\r\n">>, Trailer],
     ok = gen_tcp:send(Sock, Req),
-    {ok, _Rest} = read_101(Sock, <<>>, 2000),
-    {ok, Sock}.
+    {ok, Rest} = read_101(Sock, <<>>, 2000),
+    {ok, Sock, Rest}.
 
 read_101(Sock, Acc, Timeout) ->
     case erlang:decode_packet(http_bin, Acc, []) of
@@ -399,7 +480,13 @@ skip_headers(Sock, Buf, Timeout) ->
     end.
 
 recv_frame(Sock, Timeout) ->
-    {Msg, _} = recv_one(Sock, Timeout, {[], ws_frame:init_parser(#{role => client})}),
+    recv_frame(Sock, Timeout, <<>>).
+
+%% `Seed' is bytes already read off the socket (e.g. trailing the 101).
+recv_frame(Sock, Timeout, Seed) ->
+    P0 = ws_frame:init_parser(#{role => client}),
+    {ok, Queued, P1} = ws_frame:parse(P0, Seed),
+    {Msg, _} = recv_one(Sock, Timeout, {Queued, P1}),
     Msg.
 
 %% State is `{QueuedMessages, ParserState}`. Multi-frame recv'es fill

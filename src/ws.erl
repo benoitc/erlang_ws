@@ -33,7 +33,12 @@
     %% ws_deflate:negotiate/2); enables compression on the session.
     deflate       => ws_deflate:negotiated(),
     idle_timeout  => timeout(),
-    close_timeout => timeout()
+    close_timeout => timeout(),
+    %% Bytes the embedder read past the end of the upgrade request. A
+    %% client that pipelines its first frame with the handshake leaves
+    %% them in the embedder's buffer; hand them over here and the
+    %% session parses them before it reads the socket.
+    initial_data  => binary()
 }.
 
 -export_type([transport_mod/0, handle/0, accept_opts/0]).

@@ -207,20 +207,20 @@ start_session(Transport, Handle, Method, Path, Hdrs, Info, Rest, Opts) ->
             path => Path,
             headers => Hdrs,
             upgrade_info => Info},
+    %% `Rest' is whatever the request read pulled in past the end of the
+    %% headers, which is where a client that pipelines its first frame
+    %% with the handshake lands it. It goes in as `initial_data' so the
+    %% session replays it before activating the transport. Posting it as
+    %% a fake socket message instead would race against the real bytes
+    %% `ws:accept/6' has already armed the socket for, and would only
+    %% work for the two transports whose message shape we can forge.
     AcceptOpts = maps:merge(maps:with([idle_timeout, close_timeout], Opts),
-                            #{parser_opts => ParserOpts}),
+                            #{parser_opts => ParserOpts,
+                              initial_data => Rest}),
     case ws:accept(Transport, Handle, Req, HandlerMod, HandlerOpts,
                    AcceptOpts) of
-        {ok, Pid} ->
-            case Rest of
-                <<>> -> ok;
-                _ ->
-                    Msg = case Transport of
-                        ws_transport_gen_tcp -> {tcp, Handle, Rest};
-                        ws_transport_ssl     -> {ssl, Handle, Rest}
-                    end,
-                    Pid ! Msg
-            end;
+        {ok, _Pid} ->
+            ok;
         {error, _} ->
             Transport:close(Handle)
     end.
