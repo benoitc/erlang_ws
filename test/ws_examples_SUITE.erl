@@ -18,6 +18,7 @@
          many_concurrent_echo_clients/1,
          server_receives_fragmented_text/1,
          server_receives_frame_pipelined_with_handshake/1,
+         greeting_at_upgrade_survives_end_to_end/1,
          client_sends_pings_and_gets_pongs/1,
          server_picks_matching_subprotocol/1,
          server_rejects_no_acceptable_subprotocol/1,
@@ -33,6 +34,7 @@ all() ->
      many_concurrent_echo_clients,
      server_receives_fragmented_text,
      server_receives_frame_pipelined_with_handshake,
+     greeting_at_upgrade_survives_end_to_end,
      client_sends_pings_and_gets_pongs,
      server_picks_matching_subprotocol,
      server_rejects_no_acceptable_subprotocol,
@@ -244,6 +246,36 @@ server_receives_frame_pipelined_with_handshake(_Config) ->
         ws_h1_tcp_server:stop(Server)
     end.
 
+%% End-to-end version of the two cases above: real server, real client,
+%% no hand-rolled socket on either side. The handler greets from
+%% `init/2', so the session writes that frame immediately after the
+%% embedder's 101 and the client's first recv can pick up both.
+%%
+%% Whether it does is a timing matter, so one connection proves little
+%% and the case opens many. Each greeting must arrive whichever way the
+%% bytes were split, and the echo after it proves the parser survived
+%% the replay with its state intact.
+greeting_at_upgrade_survives_end_to_end(_Config) ->
+    {ok, Server} = ws_h1_tcp_server:start_link(
+        #{handler => greeting_server_handler,
+          handler_opts => #{greeting => <<"welcome">>}}),
+    try
+        {ok, P} = ws_h1_tcp_server:port(Server),
+        lists:foreach(fun(N) ->
+            {ok, Conn} = connect_client(P, #{}),
+            ?assertEqual({text, <<"welcome">>}, wait_msg(2000)),
+            Payload = integer_to_binary(N),
+            ws:send(Conn, {text, Payload}),
+            ?assertEqual({text, Payload}, wait_msg(2000)),
+            ok = ws:close(Conn, 1000, <<>>),
+            %% The close reply is forwarded too; drop it so the next
+            %% iteration's first message is its own greeting.
+            flush_forwards()
+        end, lists:seq(1, 50))
+    after
+        ws_h1_tcp_server:stop(Server)
+    end.
+
 client_sends_pings_and_gets_pongs(_Config) ->
     {ok, Server} = ws_h1_tcp_server:start_link(
         #{handler => echo_server, handler_opts => #{}}),
@@ -380,6 +412,14 @@ wait_msg(Timeout) ->
     receive
         {ws_forward, Msg} -> Msg
     after Timeout -> error(timeout)
+    end.
+
+%% Drain forwarded frames left over from a finished connection (the
+%% close reply, mostly) so the next one starts on an empty mailbox.
+flush_forwards() ->
+    receive
+        {ws_forward, _} -> flush_forwards()
+    after 50 -> ok
     end.
 
 wait_echo_msg(Timeout) ->
