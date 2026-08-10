@@ -4,10 +4,32 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-10
+
+### Fixed
+
+- `ws_client:connect/2` no longer loses a frame the server coalesced
+  into the same TCP segment as its 101 response. The bytes
+  `read_response/4` returned past the end of the handshake were
+  discarded, so a server that greets the instant the upgrade completes
+  left the connection silent. Reported and fixed by @longlene (#3).
+
+### Added
+
+- `initial_data` start option, on `ws_session:start/1` and
+  `ws:accept/6`: bytes the embedder read past the end of the
+  handshake. The session replays them through the parser before it
+  arms the transport, so they stay ahead of whatever the peer sends
+  next. Use it instead of posting a synthetic transport message to the
+  session, which leaves the order to chance.
 
 ### Changed
 
+- `ws_h1_tcp_server` hands the bytes it read past the request headers
+  to the session through `initial_data` rather than forging a
+  `{tcp, Handle, Rest}` message after `ws:accept/6` had already armed
+  the socket. The old path also only covered `ws_transport_gen_tcp`
+  and `ws_transport_ssl`; any other transport hit a `case_clause`.
 - `ws_h2_upgrade` (and `ws_h3_upgrade` through it) now handles
   `Sec-WebSocket-Version` the way RFC 8441 section 5 requires:
   `validate_request/1,2` rejects an extended CONNECT whose version is
